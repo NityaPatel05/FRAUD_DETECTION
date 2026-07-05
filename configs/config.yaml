@@ -1,0 +1,143 @@
+# ─────────────────────────────────────────────
+#  fraud_detection/configs/config.yaml
+# ─────────────────────────────────────────────
+
+# ── Paths ────────────────────────────────────
+paths:
+  raw_dir:               "data/raw"
+  processed_tree:        "data/processed/tree_models"
+  processed_catboost:    "data/processed/catboost"
+  processed_vae:         "data/processed/dl_models/vae"
+  processed_bilstm:      "data/processed/dl_models/bilstm"
+  processed_gnn:         "data/processed/dl_models/gnn"
+  feature_store_dir:     "data/feature_store"
+  artifacts:             "artifacts"
+  checkpoints:           "artifacts/checkpoints"
+  shap_dir:              "artifacts/shap"
+  metrics_dir:           "artifacts/metrics"
+  logs_dir:              "logs"
+
+# ── Redis ─────────────────────────────────────
+redis:
+  host:       "localhost"
+  port:       6379
+  db:         0
+  ttl_days:   30        # expire keys after 30 days
+
+# ── Data Split ────────────────────────────────
+split:
+  train_quantile: 0.75  # first 75% of TransactionDT range → train
+
+# ── Preprocessing ─────────────────────────────
+preprocessing:
+  nan_fill_trees:    -999
+  nan_fill_dl:       "median"
+  m_col_nan_fill_trees: -1   # T=1, F=0, NaN=-1
+  m_col_nan_fill_vae:   0    # T=1, F=0, NaN=0 for VAE
+
+# ── Feature Engineering ───────────────────────
+feature_engineering:
+  v_col_corr_threshold:  0.9    # drop one of pair if Pearson corr > 0.9
+  v_pca_components:      3      # PCA components per NaN group (DL only)
+  top_v_cols_shap:       50     # top V cols by SHAP for tree models
+  important_v_cols:
+    - V258
+    - V257
+    - V201
+    - V189
+    - V187
+    - V294
+    - V83
+    - V76
+
+  c_cols:   [C1, C2, C3, C4, C5, C6, C7, C8, C9, C11, C13, C14]
+  d_cols:   [D1, D2, D3, D4, D5, D6, D7, D8, D9, D10, D11, D12, D13, D14, D15]
+  m_cols:   [M1, M2, M3, M4, M5, M6, M7, M8, M9]
+
+  freq_cols_tree:
+    - card1
+    - card2
+    - card3
+    - card4
+    - card5
+    - card6
+    - addr1
+    - addr2
+    - P_emaildomain
+    - R_emaildomain
+    - DeviceInfo
+    - DeviceType
+    - uid1
+    - uid_magic
+    - id_20
+    - id_31
+
+  # CatBoost gets raw strings for these (no label-encode, no freq-encode)
+  catboost_cat_cols:
+    - card4
+    - card6
+    - ProductCD
+    - DeviceType
+    - P_emaildomain
+
+  velocity_windows:
+    - 3600      # 1 hour
+    - 86400     # 24 hours
+
+# ── BiLSTM Sequence ───────────────────────────
+bilstm:
+  seq_len:      20
+  features_per_step: 12
+  step_features:
+    - TransactionAmt_log
+    - amt_zscore
+    - uid_gap_last
+    - hour_sin
+    - hour_cos
+    - is_late_night
+    - uid_tx_1h
+    - uid_total_amt_24h
+    - D1_norm
+    - device_mobile
+    - ProductCD_encoded
+    - M_match_count
+
+# ── Inference Thresholds ──────────────────────
+inference:
+  auto_approve:   0.20
+  flag_review:    0.70
+  # p < 0.20  → Auto-approve
+  # 0.20–0.70 → Flag for review / 3DS
+  # p > 0.70  → Block + alert
+
+# ── Adversarial Validation ────────────────────────────────────────────────────
+adversarial:
+  drop_threshold: 0.70   # drop feature if single-feat adversarial AUC > 0.70
+
+# ── Neo4j (Job 1 — GNN refresh) ───────────────────────────────────────────────
+neo4j:
+  uri:          "bolt://localhost:7687"
+  user:         "neo4j"
+  password:     "password"           # override with env var NEO4J_PASSWORD in prod
+  database:     "neo4j"
+  lookback_secs: 86400               # pull last 24 h of edges for each refresh cycle
+
+# ── GNN refresh job ───────────────────────────────────────────────────────────
+gnn:
+  proj_dim:       128                # must match training config
+  embed_dim:      64                 # must match training config
+  refresh_interval_secs: 60         # how often to re-run GraphSAGE (1–5 min)
+  redis_embedding_ttl:   1800       # TTL for gnn:{card_id} keys in Redis (30 min)
+
+# ── Kafka (Job 2 — post-inference streaming) ───────────────────────────────────
+kafka:
+  bootstrap_servers: "localhost:9092"
+  graph_topic:       "graph-updates"         # Neo4j Kafka connector sinks this topic
+  label_topic:       "confirmed_fraud_labels" # fraud_label_consumer.py reads this
+  enabled:           true                    # set false for local dev without Kafka
+
+# ── Database (fraud feedback + retrain audit) ─────────────────────────────────
+database:
+  url: "postgresql://fraud:password@localhost:5432/fraud_db"
+  # For local SQLite testing (no PostgreSQL needed):
+  # url: "sqlite:///fraud_local.db"

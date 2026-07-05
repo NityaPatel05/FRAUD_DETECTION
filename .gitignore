@@ -1,0 +1,58 @@
+# ─── Python ───────────────────────────────────────────────────────────────────
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+
+# ─── Virtual Environment ───────────────────────────────────────────────────────
+venv/
+.env
+.venv/
+env/
+
+# ─── Testing / Coverage ────────────────────────────────────────────────────────
+.pytest_cache/
+.coverage
+htmlcov/
+
+# ─── Databases ─────────────────────────────────────────────────────────────────
+*.db
+*.sqlite3
+
+# ─── Logs ──────────────────────────────────────────────────────────────────────
+logs/
+*.log
+
+# ─── Notebooks ─────────────────────────────────────────────────────────────────
+.ipynb_checkpoints/
+
+# ─── DVC-tracked data & artifacts (tracked by DVC, NOT Git) ───────────────────
+# These folders are large; Git only stores the tiny .dvc pointer files.
+data/raw/
+data/processed/
+data/feature_store/
+artifacts/checkpoints/
+artifacts/metrics/
+artifacts/shap/
+mlartifacts/
+
+# ─── Large binary file extensions (safety net) ─────────────────────────────────
+*.npy
+*.pt
+*.pkl
+*.cbm
+*.parquet
+*.csv.gz
+
+# ─── Local-only scratchpad / patch scripts ─────────────────────────────────────
+test.py
+patch_notebooks.py
+patch_memory_notebook.py
+scripts/remove_docstrings.py
+scripts/write_tests.py
+
+# ─── OS / Editor ───────────────────────────────────────────────────────────────
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/

@@ -1,0 +1,195 @@
+# ─────────────────────────────────────────────
+#  fraud_detection/configs/features.yaml
+#  Defines feature subsets for each model type
+# ─────────────────────────────────────────────
+
+# ── Shared base features (all tree models) ───
+tree_base:
+  identity:
+    - uid1
+    - uid_magic
+    - uid1_freq
+    - uid_magic_freq
+
+  d_features: # All 15 normalized + originals kept
+    - D1_norm
+    - D2_norm
+    - D3_norm
+    - D4_norm
+    - D5_norm
+    - D10_norm
+    - D11_norm
+    - D15_norm
+    # D6–D9, D12–D14 — validate with forward selection
+
+  frequency_encoded:
+    - card1_freq
+    - card2_freq
+    - card3_freq
+    - card5_freq
+    - addr1_freq
+    - addr2_freq
+    - P_emaildomain_freq
+    - R_emaildomain_freq
+    - uid1_freq
+    - uid_magic_freq
+    - DeviceInfo_freq
+    - id_20_freq
+
+  uid_aggregations:
+    - uid_amt_mean
+    - uid_amt_std
+    - uid_amt_max
+    - uid_amt_min
+    - uid_tx_count
+    - card1_amt_mean
+    - card1_amt_std
+    - card1_tx_count
+    - addr1_amt_mean
+    - addr1_amt_std
+    - addr1_tx_count
+    - email_amt_mean
+    - email_tx_count
+
+  uid_c_d_m_aggregations: # Top-5% Kaggle explicit list
+    - C1_uid_mean
+    - C9_uid_mean
+    - C11_uid_mean
+    - C13_uid_mean
+    - M9_uid_mean
+    - M5_uid_mean
+    - D2_uid_mean
+    - D15_uid_mean
+    - TransactionAmt_uid_std
+
+  amount_features:
+    - TransactionAmt_log
+    - TransactionAmt_decimal
+    - amt_over_uid_mean
+    - amt_over_uid_max
+    - amt_over_card1_mean
+    - amt_zscore
+
+  velocity: # NOT used in VAE
+    - uid_tx_1h
+    - uid_tx_24h
+    - uid_total_amt_24h
+    - uid_gap_last
+    - uid_avg_gap
+
+  time_cyclic:
+    - hour_sin
+    - hour_cos
+    - dow_sin
+    - dow_cos
+    - month_sin
+    - month_cos
+    - is_weekend
+    - is_late_night
+
+  email_device:
+    - email_match
+    - P_email_is_free
+    - R_email_is_free
+    - email_trusted
+    - P_email_tld
+    - R_email_tld
+    - device_os_encoded
+    - device_browser_encoded
+    - device_mobile
+
+  c_features:
+    - C1
+    - C2
+    - C3
+    - C4
+    - C5
+    - C6
+    - C7
+    - C8
+    - C9
+    - C10
+    - C11
+    - C12
+    - C13
+    - C14
+    - C1_C2_ratio
+    - C5_C6_ratio
+    - C6_C11_ratio
+    - C3_flag
+
+  m_features:
+    - M1
+    - M2
+    - M3
+    - M4
+    - M5
+    - M6
+    - M7
+    - M8
+    - M9
+    - M_match_count
+    - M_mismatch_count
+    - M_nan_count
+
+  vae_score:
+    - vae_anomaly_score # Stage 1 output — fed to tree models + stacking
+
+# ── CatBoost-specific (raw cat strings, no freq-encode) ──
+catboost_extra_cats:
+  - card4
+  - card6
+  - ProductCD
+  - DeviceType
+  - P_emaildomain
+
+# ── VAE features (NO velocity, NO uid_magic, median-imputed) ──
+vae_features:
+  include:
+    - card1_freq
+    - addr1_freq
+    - P_emaildomain_freq
+    - uid1_freq
+    - DeviceInfo_freq
+    - uid_amt_mean
+    - uid_amt_std
+    - uid_amt_max
+    - uid_tx_count
+    - email_match
+    - email_trusted
+    - TransactionAmt_log
+    - TransactionAmt_decimal
+    - amt_zscore
+    - hour_sin
+    - hour_cos
+    - C1_C2_ratio
+    - C3_flag
+    - M_match_count
+    - M_mismatch_count
+    - M_nan_count
+    - D1_norm
+    - D2_norm
+    - D3_norm
+    - D4_norm
+    - D5_norm
+    - D10_norm
+    - D11_norm
+    - D15_norm
+  # + PCA V components (computed at runtime: ~30-40 components)
+  # + C1-C14 raw (median imputed, not -999)
+  # + M1-M9 (NaN=0 for VAE, not -1)
+
+  exclude: # Hard excludes for VAE
+    - uid_tx_1h
+    - uid_tx_24h
+    - uid_total_amt_24h
+    - uid_gap_last
+    - uid_avg_gap
+    - uid_magic
+    - uid_magic_freq
+
+# ── Stacking meta-learner inputs ─────────────
+stacking_inputs:
+  - xgb_prob
+  - lgbm_prob
+  - catboost_prob
