@@ -1,0 +1,79 @@
+version: "3.9"
+
+# Minimal local dev stack for the fraud detection real-time pipeline.
+# Starts Redis, Kafka (with Zookeeper), and PostgreSQL.
+#
+# Usage:
+#   docker compose up -d
+#   docker compose logs -f kafka     # watch Kafka broker logs
+#   docker compose down -v           # teardown + delete volumes
+
+services:
+
+  # ── Redis (feature store + sequence windows + ring sets) ───────────────────
+  redis:
+    image: redis:7-alpine
+    container_name: fraud_redis
+    ports:
+      - "6379:6379"
+    command: redis-server --save "" --appendonly no   # disable persistence for dev
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+
+  # ── Zookeeper (required by Kafka) ────────────────────────────────────────────
+  zookeeper:
+    image: confluentinc/cp-zookeeper:7.5.0
+    container_name: fraud_zookeeper
+    environment:
+      ZOOKEEPER_CLIENT_PORT: 2181
+      ZOOKEEPER_TICK_TIME: 2000
+    ports:
+      - "2181:2181"
+
+  # ── Kafka broker ─────────────────────────────────────────────────────────────
+  kafka:
+    image: confluentinc/cp-kafka:7.5.0
+    container_name: fraud_kafka
+    depends_on:
+      zookeeper:
+        condition: service_started
+    ports:
+      - "9092:9092"
+    environment:
+      KAFKA_BROKER_ID: 1
+      KAFKA_ZOOKEEPER_CONNECT: fraud_zookeeper:2181
+      KAFKA_ADVERTISED_LISTENERS: PLAINTEXT://localhost:9092
+      KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: PLAINTEXT:PLAINTEXT
+      KAFKA_INTER_BROKER_LISTENER_NAME: PLAINTEXT
+      KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 1
+      KAFKA_AUTO_CREATE_TOPICS_ENABLE: "true"   # auto-creates graph-updates + confirmed_fraud_labels
+      KAFKA_LOG_RETENTION_HOURS: 24
+    healthcheck:
+      test: ["CMD", "kafka-broker-api-versions", "--bootstrap-server", "localhost:9092"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+
+  # ── PostgreSQL (training_transactions + model_versions) ────────────────────
+  postgres:
+    image: postgres:15-alpine
+    container_name: fraud_postgres
+    ports:
+      - "5432:5432"
+    environment:
+      POSTGRES_USER:     fraud
+      POSTGRES_PASSWORD: password
+      POSTGRES_DB:       fraud_db
+    volumes:
+      - fraud_pg_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U fraud -d fraud_db"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+
+volumes:
+  fraud_pg_data:
