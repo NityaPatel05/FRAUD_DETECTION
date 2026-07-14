@@ -42,27 +42,27 @@ The system is a **5-stage sequential ensemble** where each stage feeds into the 
 
 ```mermaid
 flowchart TD
-    A[Raw Transaction] --> B[Stage 1: VAE Anomaly Detector<br/>reconstruction error -> score]
-    B --> C[Stage 2: GNN Card Embeddings<br/>pre-computed 64-dim node embedding per card1]
-    C -->|vae_anomaly_score + gnn_emb_0..63 injected as features| D{Stage 3: Parallel Tree Models}
-    D --> E1[XGBoost]
-    D --> E2[LightGBM]
-    D --> E3[CatBoost]
-    E1 -->|xgb_prob| F[Stage 4: Stacking Meta-Learner<br/>LogisticRegression on probabilities<br/>-> stacking_score continuous 0-1]
-    E2 -->|lgbm_prob| F
-    E3 -->|catboost_prob| F
-    F --> G[Stage 5: BiLSTM Sequential Model<br/>10-step sequence window from Redis<br/>calibrated_stacking_score as feature at each step<br/>-> Platt Scaler -> bilstm_prob]
-    G --> H[Tiered Score Fusion<br/>Cold Start Aware]
-    H -->|tx < 3| H1[stacking_score only]
-    H -->|tx 3-5| H2[linear blend stacking -> bilstm]
-    H -->|tx >= 6| H3[bilstm_prob only]
-    H1 --> I((final_fraud_prob))
+    A["Raw Transaction"] --> B["Stage 1: VAE Anomaly Detector<br/>reconstruction error -> score"]
+    B --> C["Stage 2: GNN Card Embeddings<br/>pre-computed 64-dim node embedding per card1"]
+    C -->|"vae_anomaly_score + gnn_emb_0..63 injected as features"| D{"Stage 3: Parallel Tree Models"}
+    D --> E1["XGBoost"]
+    D --> E2["LightGBM"]
+    D --> E3["CatBoost"]
+    E1 -->|"xgb_prob"| F["Stage 4: Stacking Meta-Learner<br/>LogisticRegression on probabilities<br/>-> stacking_score continuous 0-1"]
+    E2 -->|"lgbm_prob"| F
+    E3 -->|"catboost_prob"| F
+    F --> G["Stage 5: BiLSTM Sequential Model<br/>10-step sequence window from Redis<br/>calibrated_stacking_score as feature at each step<br/>-> Platt Scaler -> bilstm_prob"]
+    G --> H["Tiered Score Fusion<br/>Cold Start Aware"]
+    H -->|"tx < 3"| H1["stacking_score only"]
+    H -->|"tx 3-5"| H2["linear blend stacking -> bilstm"]
+    H -->|"tx >= 6"| H3["bilstm_prob only"]
+    H1 --> I(("final_fraud_prob"))
     H2 --> I
     H3 --> I
-    I --> J{Decision Thresholds}
-    J -->|p < 0.20| K1[auto_approve]
-    J -->|0.20-0.70| K2[flag_review / trigger 3DS]
-    J -->|p > 0.70| K3[block + alert fraud team]
+    I --> J{"Decision Thresholds"}
+    J -->|"p < 0.20"| K1["auto_approve"]
+    J -->|"0.20-0.70"| K2["flag_review / trigger 3DS"]
+    J -->|"p > 0.70"| K3["block + alert fraud team"]
 ```
 
 ---
@@ -466,41 +466,41 @@ The real-time inference engine is implemented in `src/inference/predict.py` as t
 
 ```mermaid
 flowchart TD
-    Req([Incoming Transaction Request]) --> S1[Step 1: Build UIDs]
-    S1 --> S2[Step 2: Fast Ring Check]
-    S2 --> S3[Step 3: Get User Meta]
-    S3 --> S4{Step 4: Parallel Redis Fetch}
+    Req(["Incoming Transaction Request"]) --> S1["Step 1: Build UIDs"]
+    S1 --> S2["Step 2: Fast Ring Check"]
+    S2 --> S3["Step 3: Get User Meta"]
+    S3 --> S4{"Step 4: Parallel Redis Fetch"}
     
-    S4 --> R1[Velocity Windows]
-    S4 --> R2[Static Aggregations]
-    S4 --> R3[GNN Embeddings]
+    S4 --> R1["Velocity Windows"]
+    S4 --> R2["Static Aggregations"]
+    S4 --> R3["GNN Embeddings"]
     
-    R1 --> S5[Step 5: Compute Derived Features]
+    R1 --> S5["Step 5: Compute Derived Features"]
     R2 --> S5
     R3 --> S5
     
-    S5 --> S6[Step 6: VAE Anomaly Score]
-    S6 --> S7{Step 7: Parallel Tree Models}
+    S5 --> S6["Step 6: VAE Anomaly Score"]
+    S6 --> S7{"Step 7: Parallel Tree Models"}
     
-    S7 --> T1[XGBoost]
-    S7 --> T2[LightGBM]
-    S7 --> T3[CatBoost]
+    S7 --> T1["XGBoost"]
+    S7 --> T2["LightGBM"]
+    S7 --> T3["CatBoost"]
     
-    T1 --> S8[Step 8: Stacking Meta-Learner]
+    T1 --> S8["Step 8: Stacking Meta-Learner"]
     T2 --> S8
     T3 --> S8
     
-    S8 --> S9[Step 9: BiLSTM Sequential Model<br>Lua atomic fetch + model forward pass]
-    S9 --> S10[Step 10: Tiered Score Fusion]
-    S10 --> S11[Step 11: Decision Thresholds]
+    S8 --> S9["Step 9: BiLSTM Sequential Model<br/>Lua atomic fetch + model forward pass"]
+    S9 --> S10["Step 10: Tiered Score Fusion"]
+    S10 --> S11["Step 11: Decision Thresholds"]
     
-    S11 --> Resp([Return Response to API])
+    S11 --> Resp(["Return Response to API"])
     
-    S11 -.->|Async Fire & Forget| S12{Step 12: Post-Inference Async}
-    S12 -.-> A1[Update Velocity]
-    S12 -.-> A2[Kafka Stream to Neo4j]
-    S12 -.-> A3[Update Ring Signals]
-    S12 -.-> A4[Update BiLSTM Seq Window]
+    S11 -.->|"Async Fire and Forget"| S12{"Step 12: Post-Inference Async"}
+    S12 -.-> A1["Update Velocity"]
+    S12 -.-> A2["Kafka Stream to Neo4j"]
+    S12 -.-> A3["Update Ring Signals"]
+    S12 -.-> A4["Update BiLSTM Seq Window"]
 ```
 
 ### 12-Step Single Transaction Pipeline (`predict_single`)
