@@ -464,6 +464,45 @@ The `FraudDetectionPredictor.load_all()` method automatically detects whether fu
 
 The real-time inference engine is implemented in `src/inference/predict.py` as the `FraudDetectionPredictor` class. It loads all models once at startup and predicts individual transactions or batches.
 
+```mermaid
+flowchart TD
+    Req([Incoming Transaction Request]) --> S1[Step 1: Build UIDs]
+    S1 --> S2[Step 2: Fast Ring Check]
+    S2 --> S3[Step 3: Get User Meta]
+    S3 --> S4{Step 4: Parallel Redis Fetch}
+    
+    S4 --> R1[Velocity Windows]
+    S4 --> R2[Static Aggregations]
+    S4 --> R3[GNN Embeddings]
+    
+    R1 --> S5[Step 5: Compute Derived Features]
+    R2 --> S5
+    R3 --> S5
+    
+    S5 --> S6[Step 6: VAE Anomaly Score]
+    S6 --> S7{Step 7: Parallel Tree Models}
+    
+    S7 --> T1[XGBoost]
+    S7 --> T2[LightGBM]
+    S7 --> T3[CatBoost]
+    
+    T1 --> S8[Step 8: Stacking Meta-Learner]
+    T2 --> S8
+    T3 --> S8
+    
+    S8 --> S9[Step 9: BiLSTM Sequential Model<br>Lua atomic fetch + model forward pass]
+    S9 --> S10[Step 10: Tiered Score Fusion]
+    S10 --> S11[Step 11: Decision Thresholds]
+    
+    S11 --> Resp([Return Response to API])
+    
+    S11 -.->|Async Fire & Forget| S12{Step 12: Post-Inference Async}
+    S12 -.-> A1[Update Velocity]
+    S12 -.-> A2[Kafka Stream to Neo4j]
+    S12 -.-> A3[Update Ring Signals]
+    S12 -.-> A4[Update BiLSTM Seq Window]
+```
+
 ### 12-Step Single Transaction Pipeline (`predict_single`)
 
 | Step | Action                                                                | Latency     |
