@@ -58,13 +58,52 @@ def captured(fn):
     return res, text, err
 
 
+_DRIVER_TO_CUDA = [(570, "12.8"), (560, "12.6"), (550, "12.4"), (530, "12.1"), (520, "11.8")]
+
+
+def _parse_cuda_from_nvidia_smi():
+    """(cuda_version or None, driver_version or None) — robust to nvidia-smi format changes."""
+    import re as _re
+    import subprocess as _sp
+    try:
+        out = _sp.run(["nvidia-smi"], capture_output=True, text=True, timeout=30).stdout
+    except (FileNotFoundError, _sp.TimeoutExpired):
+        return None, None
+    pats = [r"CUDA Version\s*:\s*([\d]+\.[\d]+)", r"CUDA Driver Version\s*:\s*([\d]+\.[\d]+)",
+            r"CUDA[^\n:|]*Version\s*:?\s*([\d]+\.[\d]+)"]
+    for pat in pats:
+        m = _re.search(pat, out)
+        if m:
+            return m.group(1), None
+    try:
+        q = _sp.run(["nvidia-smi", "-q"], capture_output=True, text=True, timeout=30).stdout
+        for pat in pats:
+            m = _re.search(pat, q)
+            if m:
+                return m.group(1), None
+        drv = _sp.run(["nvidia-smi", "--query-gpu=driver_version", "--format=csv,noheader"],
+                      capture_output=True, text=True, timeout=30).stdout.strip().splitlines()
+        drv = drv[0] if drv else None
+    except (FileNotFoundError, _sp.TimeoutExpired):
+        drv = None
+    if drv:
+        try:
+            major = int(drv.split(".")[0])
+            for min_drv, cuda in _DRIVER_TO_CUDA:
+                if major >= min_drv:
+                    return cuda, drv
+        except ValueError:
+            pass
+    return None, drv
+
+
 def check_nvidia():
     try:
         out = subprocess.run(["nvidia-smi"], capture_output=True, text=True, timeout=20).stdout
         name = subprocess.run(["nvidia-smi", "--query-gpu=name,driver_version,memory.total", "--format=csv,noheader"],
                               capture_output=True, text=True, timeout=20).stdout.strip()
-        cuda = re.search(r"CUDA Version:\s*([\d.]+)", out)
-        return True, f"{name} | driver CUDA {cuda.group(1) if cuda else '?'}"
+        cuda, _ = _parse_cuda_from_nvidia_smi()
+        return True, f"{name} | driver CUDA {cuda or '?'}"
     except (FileNotFoundError, subprocess.TimeoutExpired):
         return False, "nvidia-smi not found — no NVIDIA driver on this machine"
 
@@ -119,6 +158,10 @@ def main(args):
                      [(n, (lambda n=n: check_model(n, args.device, cfg[n], X, y))) for n in ["xgb", "catboost", "lgbm"]]:
         res, text, err = captured(fn)
         if err:
+            if label == "torch" and args.torch_optional:
+                lines.append(f"[{label}] not available (optional: only the GRU experiment needs it)\n"
+                             f"        {err.strip().splitlines()[-1]}")
+                continue
             lines.append(f"[{label}] ERROR\n{err}"); failures.append(f"{label}: error"); continue
         msg_, used = (res, None) if label == "torch" else res
         lines.append(f"[{label}] {msg_}")
@@ -143,4 +186,6 @@ if __name__ == "__main__":
     ap = argparse.ArgumentParser()
     ap.add_argument("--device", choices=["gpu", "cpu"], default="gpu")
     ap.add_argument("--allow-lgbm-cpu", action="store_true")
+    ap.add_argument("--torch-optional", action="store_true",
+                    help="torch/CUDA missing is a warning, not a failure (tree models decide the device)")
     main(ap.parse_args())

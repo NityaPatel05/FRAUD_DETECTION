@@ -104,7 +104,7 @@ def run_feature_pipeline_v2(
         # float32 per part BEFORE concatenating keeps peak RAM low (~1.1M rows x 430 cols)
         part = _downcast(part.copy())
         part.columns = [c.replace("id-", "id_") if c.startswith("id-") else c for c in part.columns]
-        part["split"] = name
+        part = part.assign(split=name)              # assign (not insert): no fragmentation warning
         parts.append(part)
     df = pd.concat(parts, ignore_index=True)
     del parts

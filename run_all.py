@@ -103,13 +103,47 @@ def _in_project_venv() -> bool:
         return False
 
 
-def _driver_cuda_version():
+_DRIVER_TO_CUDA = [(570, "12.8"), (560, "12.6"), (550, "12.4"), (530, "12.1"), (520, "11.8")]
+
+
+def _parse_cuda_from_nvidia_smi():
+    """(cuda_version or None, driver_version or None) — robust to nvidia-smi format changes."""
+    import re as _re
+    import subprocess as _sp
     try:
-        out = subprocess.run(["nvidia-smi"], capture_output=True, text=True, timeout=30).stdout
-        m = re.search(r"CUDA Version:\s*([\d.]+)", out)
-        return m.group(1) if m else None
-    except (FileNotFoundError, subprocess.TimeoutExpired):
-        return None
+        out = _sp.run(["nvidia-smi"], capture_output=True, text=True, timeout=30).stdout
+    except (FileNotFoundError, _sp.TimeoutExpired):
+        return None, None
+    pats = [r"CUDA Version\s*:\s*([\d]+\.[\d]+)", r"CUDA Driver Version\s*:\s*([\d]+\.[\d]+)",
+            r"CUDA[^\n:|]*Version\s*:?\s*([\d]+\.[\d]+)"]
+    for pat in pats:
+        m = _re.search(pat, out)
+        if m:
+            return m.group(1), None
+    try:
+        q = _sp.run(["nvidia-smi", "-q"], capture_output=True, text=True, timeout=30).stdout
+        for pat in pats:
+            m = _re.search(pat, q)
+            if m:
+                return m.group(1), None
+        drv = _sp.run(["nvidia-smi", "--query-gpu=driver_version", "--format=csv,noheader"],
+                      capture_output=True, text=True, timeout=30).stdout.strip().splitlines()
+        drv = drv[0] if drv else None
+    except (FileNotFoundError, _sp.TimeoutExpired):
+        drv = None
+    if drv:
+        try:
+            major = int(drv.split(".")[0])
+            for min_drv, cuda in _DRIVER_TO_CUDA:
+                if major >= min_drv:
+                    return cuda, drv
+        except ValueError:
+            pass
+    return None, drv
+
+
+def _driver_cuda_version():
+    return _parse_cuda_from_nvidia_smi()[0]
 
 
 def _req_fingerprint() -> str:
@@ -245,8 +279,7 @@ def driver_cuda() -> tuple[bool, str | None, str]:
         out = subprocess.run(["nvidia-smi"], capture_output=True, text=True, timeout=30).stdout
         name = subprocess.run(["nvidia-smi", "--query-gpu=name,driver_version", "--format=csv,noheader"],
                               capture_output=True, text=True, timeout=30).stdout.strip()
-        m = re.search(r"CUDA Version:\s*([\d.]+)", out)
-        return True, (m.group(1) if m else None), name
+        return True, _parse_cuda_from_nvidia_smi()[0], name
     except (FileNotFoundError, subprocess.TimeoutExpired):
         return False, None, "no NVIDIA driver (nvidia-smi not found)"
 
@@ -336,7 +369,7 @@ def download_from_kaggle(raw: Path, args) -> None:
 def step_gpu_check(args) -> dict:
     if args.cpu:
         return {"device": "cpu", "smoke": "skipped (--cpu)"}
-    rc = run_cmd("gpu_check", [PY, "scripts/gpu_smoke_test.py", "--allow-lgbm-cpu"])
+    rc = run_cmd("gpu_check", [PY, "scripts/gpu_smoke_test.py", "--allow-lgbm-cpu", "--torch-optional"])
     if rc == 0:
         return {"device": "gpu", "smoke": "PASS"}
     if args.require_gpu:
