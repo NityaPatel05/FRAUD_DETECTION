@@ -28,6 +28,9 @@ def load_raw_data(raw_dir: str) -> Tuple[pd.DataFrame, pd.DataFrame]:
     train_id  = pd.read_csv(raw / "train_identity.csv")
     test_txn  = pd.read_csv(raw / "test_transaction.csv")
     test_id   = pd.read_csv(raw / "test_identity.csv")
+    # Kaggle's test_identity.csv names columns "id-01".."id-38" while train uses
+    # "id_01".."id_38". Without this rename every identity feature is missing on test.
+    test_id.columns = [c.replace("id-", "id_") for c in test_id.columns]
 
     train_df = train_txn.merge(train_id, on="TransactionID", how="left")
     test_df  = test_txn.merge(test_id,  on="TransactionID", how="left")

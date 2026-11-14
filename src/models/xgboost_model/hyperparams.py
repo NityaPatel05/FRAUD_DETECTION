@@ -41,3 +41,4 @@ XGB_SEARCH_SPACE = {
     "reg_alpha":        ("float", 0.001, 0.1, True),
     "reg_lambda":       ("float", 0.001, 0.1, True),
 }
+ 

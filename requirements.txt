@@ -1,0 +1,40 @@
+# Core ML
+xgboost>=2.0.0
+lightgbm>=4.0.0
+catboost>=1.2.0
+scikit-learn>=1.3.0
+
+# Deep Learning
+torch>=2.1.0
+torch-geometric>=2.4.0  # for GNN
+
+# Data
+pandas>=2.0.0
+numpy>=1.24.0
+scipy>=1.11.0
+
+# Feature Store
+redis>=5.0.0
+hiredis>=2.2.0
+
+# Utilities
+pyyaml>=6.0
+tqdm>=4.65.0
+joblib>=1.3.0
+
+# Visualization / Analysis
+matplotlib>=3.7.0
+seaborn>=0.12.0
+shap>=0.43.0
+
+# Logging
+loguru>=0.7.0
+
+# Background Jobs (optional — install only if running Job 1 / Job 2)
+# neo4j>=5.0.0          # Job 1: GNN refresh — Neo4j graph database driver
+# kafka-python>=2.0.2   # Job 2: post-inference Kafka streaming to Neo4j
+
+# Fraud Feedback Infrastructure (optional — install for label ingestion + retrain)
+# sqlalchemy>=2.0.0     # ORM for training_transactions + model_versions tables
+# psycopg2-binary>=2.9  # PostgreSQL adapter (use aiosqlite for local SQLite testing)
+

@@ -258,7 +258,7 @@ class TestDataLeakage:
 
 class TestModelOutputBoundaries:
 
-    def test_stacking_score_bounded_0_1(self):
+    def test_stacking_score_bounded_0_1(self, tmp_path):
         """Check 3.1: predict_meta_learner must always return values in [0.0, 1.0]."""
         from src.models.stacking.meta_learner import train_meta_learner, predict_meta_learner
 
@@ -275,7 +275,9 @@ class TestModelOutputBoundaries:
 
         result = train_meta_learner(
             probs_train, y_train, probs_val, y_val,
-            save_dir="artifacts/checkpoints",
+            # Never write into the real checkpoints dir: this test previously
+            # overwrote the production meta_learner.pkl with a 500-row random fit.
+            save_dir=str(tmp_path),
         )
         preds = predict_meta_learner(
             result["model"], result["scaler"],

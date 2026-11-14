@@ -16,6 +16,8 @@ paths:
   shap_dir:              "artifacts/shap"
   metrics_dir:           "artifacts/metrics"
   logs_dir:              "logs"
+  processed_v2:          "data/processed/v2_{mode}"   # v2 tree features ({mode}=causal|transductive)
+  artifacts_v2:          "artifacts/v2/{mode}"        # v2 models/metrics (legacy checkpoints untouched)
 
 # ── Redis ─────────────────────────────────────
 redis:
@@ -141,3 +143,159 @@ database:
   url: "postgresql://fraud:password@localhost:5432/fraud_db"
   # For local SQLite testing (no PostgreSQL needed):
   # url: "sqlite:///fraud_local.db"
+
+# ══════════════════════════════════════════════════════════════════════════════
+#  v2 pipeline (tree models) — see scripts/run_feature_engineering.py,
+#  scripts/run_feature_selection.py, scripts/run_training.py
+# ══════════════════════════════════════════════════════════════════════════════
+fe_v2:
+  # causal       = client statistics use only past rows (servable online; honest score)
+  # transductive = statistics over all rows incl. future (Kaggle 1st-place style; optimistic)
+  agg_mode:             causal
+  label_delay_days:     30        # fraud labels only usable once older than this
+  label_smoothing:      20.0      # pseudo-count pulling entity fraud rates to the global rate
+  velocity_windows_sec: [3600, 86400, 604800, 2592000]   # 1h, 1d, 7d, 30d
+  count_window_days:    30        # causal count-encoding window
+  v_corr_threshold:     0.75
+  use_label_history:    true
+  use_graph_features:   true
+  # schema: full = all IEEE-CIS columns (best-accuracy benchmark)
+  #         raw  = only fields a real payment gateway receives + our own features
+  #                (drops Vesta pre-computed V*, C*, D2-D15, id_01-id_11) → the model the live system serves
+  schema:               full
+  drop_cols:            null      # null → derived_signals.DEFAULT_DROP (data-study removals)
+  use_derived_signals:  true      # Phase 2: cross-border, proxy, email class, device parsing …
+  use_behaviour_v3:     true      # Phase 3: replaces BiLSTM (EMA profiles, multi-entity velocity, lags, habits)
+  use_network_v4:       true      # Phase 4: replaces GNN (shared-entity windows, 2-hop exposure, clusters, rings)
+  use_hmm_features:     true      # Phase 3e: HMM "surprise" of the current txn given the last 2 (Lucas et al.)
+  hmm_states:           5
+  ema_half_lives_sec:   [3600, 86400, 604800, 2592000]
+  hub_cap:              20        # a device shared by more clients than this stops linking identities
+
+training_v2:
+  # cpu | gpu. gpu → XGBoost device=cuda, CatBoost task_type=GPU, LightGBM device_type=gpu
+  # (LightGBM falls back to CPU automatically if its wheel has no GPU support).
+  # Feature engineering always runs on CPU (pandas + numba) — it is not the bottleneck.
+  device:         cpu
+  # Time-ordered CV inside the train period: each fold validates on a later
+  # window, separated from its training data by a gap (label-delay realism).
+  n_folds:        3
+  fold_val_days:  15
+  gap_days:       7
+  refit_max_round_scale: 1.5      # refit rounds = mean(best_iter) * min(n_refit_rows / n_fold_train_rows, this)
+  n_seeds:        3               # seed-bagging for the refit models
+  early_stopping_rounds: 200
+  models:         [lgbm, xgb, catboost]
+  postprocess_uid_smoothing: true # also report AP after averaging scores per client
+
+  lgbm:
+    objective:         binary
+    learning_rate:     0.02
+    n_estimators:      6000       # upper bound; early stopping picks the real number
+    num_leaves:        384
+    max_depth:         -1
+    min_child_samples: 100
+    subsample:         0.8
+    subsample_freq:    1
+    colsample_bytree:  0.4
+    reg_lambda:        2.0
+    reg_alpha:         0.0
+    scale_pos_weight:  1.0        # NO class weighting: it lowered AUC-PR in every study we found
+    n_jobs:            -1
+    verbose:           -1
+    # GPU only (ignored on CPU): OpenCL platform/device of the NVIDIA card. Leave -1 for
+    # auto; set after `scripts/gpu_smoke_test.py` shows which platform is NVIDIA.
+    gpu_platform_id:   -1
+    gpu_device_id:     -1
+
+  xgb:                            # Deotte (IEEE-CIS 1st place) settings
+    objective:         "binary:logistic"
+    learning_rate:     0.02
+    n_estimators:      6000
+    max_depth:         12
+    subsample:         0.8
+    colsample_bytree:  0.4
+    min_child_weight:  1
+    tree_method:       hist
+    eval_metric:       aucpr
+    scale_pos_weight:  1.0
+    n_jobs:            -1
+
+  catboost:
+    learning_rate:     0.03
+    iterations:        6000
+    depth:             8
+    l2_leaf_reg:       5
+    eval_metric:       PRAUC
+    has_time:          true       # ordered target statistics follow time order
+    thread_count:      -1
+    verbose:           500
+
+# ══════════════════════════════════════════════════════════════════════════════
+#  Phase 6 — novelty layer (replaces the VAE): scripts/run_novelty_monitoring.py
+# ══════════════════════════════════════════════════════════════════════════════
+novelty:
+  out_dir:            "artifacts/v2/novelty"
+  period_sec:         3600          # hourly segment series
+  segment_cols:       [ProductCD, card4, card6, P_email_class, DeviceType, amount_band, addr2]
+  z_threshold:        6.0           # robust z vs the segment's own previous week
+  min_periods:        2             # sustained for >= 2 consecutive hours
+  min_volume:         20            # ignore tiny segments
+  baseline_periods:   168           # 1 week of hours
+  max_alerts_to_mine: 10
+  rule_cols:          [ProductCD, card4, card6, P_emaildomain, DeviceType, addr2, card3, card5, amount_band, P_email_class]
+  min_support:        0.05
+  min_lift:           3.0
+  max_rules_per_alert: 5
+  min_backtest_precision: 0.10      # vs ~3.5% base rate
+  rule_ttl_days:      14            # every rule expires
+  discovery_num_cols: [TransactionAmt, uid_n_1h, uid_n_1d, uid_amt_sum_1d, amt_z_vs_own_past,
+                       uid_hours_since_prev, device_fp_clients_7d, uid_ema_burst, card1_addr1_n_1h]
+
+# ══════════════════════════════════════════════════════════════════════════════
+#  Phase 7 — decision layer (src/serving/decision.py, scripts/run_policy_simulation.py)
+#  Costs are in the transaction currency. These are ASSUMPTIONS — set them with the
+#  business; run_policy_simulation.py shows how decisions and money change with them.
+# ══════════════════════════════════════════════════════════════════════════════
+decision_v2:
+  bundle_kind:                 refit      # refit (trained on train) | final (train+val)
+  fraud_loss_rate:             1.0        # share of the amount lost when fraud is approved
+  chargeback_fee:              15.0
+  margin_rate:                 0.03       # profit on a legit sale (lost if declined)
+  decline_cost:                0.5        # operational cost of any decline
+  false_decline_churn_cost:    20.0       # future business lost when a GOOD customer is declined
+  step_up_cost:                0.3        # 3DS / OTP cost
+  step_up_fraud_stop_rate:     0.8
+  step_up_legit_abandon_rate:  0.05
+  review_cost:                 3.0        # analyst minutes
+  review_fraud_stop_rate:      0.9
+  review_capacity_per_day:     500        # analysts can review this many per day
+  review_min_p:                0.0        # set by run_policy_simulation.py from capacity
+  explain_min_p:               0.2        # attach reason codes above this score
+  decision_log:                "artifacts/v2/decisions/decisions.jsonl"
+  rules_file:                  "artifacts/v2/novelty/active_rules.yaml"
+  lists_file:                  "artifacts/v2/decisions/lists.yaml"   # allow/block lists
+  state_snapshot:              "artifacts/v2/decisions/engine_state.pkl"
+
+# ══════════════════════════════════════════════════════════════════════════════
+#  Phase 8 — feedback loop & safe deployment (src/feedback/, src/jobs/retrain_v2.py)
+# ══════════════════════════════════════════════════════════════════════════════
+feedback_v2:
+  maturity_days:      90          # a txn becomes a usable NEGATIVE only after this (chargeback window)
+  registry:           "artifacts/v2/registry.json"
+  monitoring_dir:     "artifacts/v2/monitoring"
+  psi_reference_days: 7
+  alert_bands:                    # metric: [low, high]
+    rate_decline:     [0.0, 0.03]
+    rate_review:      [0.0, 0.02]
+    p99_latency_ms:   [0.0, 50.0]
+    score_psi:        [0.0, 0.2]
+    fpr_flagged:      [0.0, 0.02]
+  promotion:
+    min_ap_gain:      0.005       # same keep rule as feature ablations
+    max_rate_shift:   0.25        # decline/review/step-up rates may move at most ±25% (SafetyNet)
+    fpr:              0.01
+  explore_q_max:      0.05        # P(let a would-be-blocked txn through), decays with score…
+  explore_q_min:      0.001       # …down to 1 in 1000 for the riskiest
+  sim_current_block_rate: 0.01
+  sim_candidate_block_rates: [0.005, 0.01, 0.02, 0.03]

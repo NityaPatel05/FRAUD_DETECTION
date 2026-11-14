@@ -6,6 +6,53 @@ The pipeline covers the full lifecycle: offline training with K-fold cross-valid
 
 ---
 
+## v2 training pipeline (tree ensemble)
+
+The offline training path was rebuilt after an audit found the old one capped at ~0.61 AUC-PR by pipeline bugs:
+- the data was split twice;
+- a drift filter deleted the strongest columns;
+- client statistics were computed from training rows only, so new clients got `-999`;
+- string columns were silently dropped;
+- class weighting was on everywhere;
+- scores came from an average of stale fold models.
+
+Run in order (all paths come from `configs/config.yaml`, sections `fe_v2` and `training_v2`):
+
+```bash
+python scripts/run_preprocessing.py          # one time split: train ≈ days 1-130, val ≈ 131-182, Kaggle test
+python scripts/run_feature_engineering.py    # v2 features → data/processed/v2_<mode>/
+python scripts/run_feature_selection.py      # time-consistency check → artifacts/v2/<mode>/dropped_features.json
+python scripts/run_training.py               # time-fold CV → refit → val report (artifacts/v2/<mode>/metrics_val.json)
+python scripts/run_training.py --final       # refit on train+val → Kaggle test predictions
+```
+
+Useful flags: `--agg-mode causal|transductive`, `--models lgbm`, `--fast` (higher learning rate, 1 seed), `--no-selection`.
+
+What the v2 features do:
+
+| Module | Practice |
+|---|---|
+| `base_features.py` | Every string column label-encoded; M4 fixed; only anchor-type D columns normalised (`day - D`); no absolute-time features |
+| `client_features.py` | Client key `card1_addr1_(day-D1)` used only for grouping; per-client means, stds, distinct counts, 1h/1d/7d/30d velocity, deviation from the client's own past, lags, first-seen flags |
+| `label_history.py` | Past fraud counts and smoothed rates per client, card, address and device, using only labels older than `label_delay_days` |
+| `graph_features.py` | Shared-entity statistics (clients per device, devices per client, …) in place of the GNN classifier |
+| `entity_ops.py` | Vectorised point-in-time primitives, tested against brute force and for zero future leakage (`tests/test_v2_pipeline.py`) |
+
+`agg_mode: causal` uses only past rows and can be served in real time; this is the honest score. `transductive` aggregates over all rows, as in the Kaggle 1st-place solution; it is optimistic on a time holdout. The VAE, BiLSTM and GNN trainers and the legacy `pipeline.py` remain in `src/` but are not part of v2.
+
+**Serving (v2):** `src/serving/` holds three pieces:
+- an online feature engine that is parity-tested against the offline features;
+- a decision service: allow/block lists → calibrated model → rules → cost-based policy, with reason codes and a decision log;
+- a FastAPI app: `uvicorn src.serving.api_v2:app`.
+
+**Feedback loop:** `src/feedback/` provides labels with maturity, a champion/challenger promotion gate, monitoring and exploration.
+
+**Novelty layer:** `src/novelty/` replaces the old VAE.
+
+The full run order and status are in `docs/IMPROVEMENT_PLAN.md`. The legacy `server.py` / `src/inference/` path is unchanged.
+
+---
+
 ## Table of Contents
 
 1. [Overall Architecture](#overall-architecture)

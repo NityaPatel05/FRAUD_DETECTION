@@ -56,3 +56,14 @@ scripts/write_tests.py
 Thumbs.db
 .vscode/
 .idea/
+/mlartifacts
+
+# v2 pipeline outputs (large; regenerate with scripts/run_*.py)
+artifacts/v2/
+
+# run_all.py outputs
+results/
+
+# generated locally, never committed
+catboost_info/
+data/synthetic/

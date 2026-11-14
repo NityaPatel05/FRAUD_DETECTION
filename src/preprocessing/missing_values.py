@@ -31,7 +31,12 @@ def encode_m_columns(
         m_cols = [c for c in M_COLS if c in df.columns]
 
     for col in m_cols:
-        df[col] = df[col].map({"T": 1, "F": 0}).fillna(nan_value).astype(int)
+        # M4 takes values M0/M1/M2 (not T/F); mapping it with T/F made it all NaN.
+        mapping = {"M0": 0, "M1": 1, "M2": 2} if col == "M4" else {"T": 1, "F": 0}
+        if df[col].dtype == object:
+            df[col] = df[col].map(mapping)
+        # numeric dtype → already encoded; only fill NaNs (re-mapping would wipe it)
+        df[col] = df[col].fillna(nan_value).astype(int)
 
     logger.info(
         "Encoded {} M-columns (NaN → {}).  Sample: {}",

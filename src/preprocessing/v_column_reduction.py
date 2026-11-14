@@ -190,3 +190,52 @@ def add_uid_v_aggregations(
     added = [f"{v}_uid_{stat}" for v in present_v for stat in ("mean", "std")]
     logger.info("Added {} uid-V aggregation columns.", len(added))
     return df
+
+
+# ─────────────────────────────────────────────────────────
+# 4. Deotte-style reduction (v2 tree pipeline)
+# ─────────────────────────────────────────────────────────
+
+def reduce_v_keep_most_unique(
+    df: pd.DataFrame,
+    groups: Dict[int, List[str]],
+    corr_threshold: float = 0.75,
+) -> List[str]:
+    """
+    Within each NaN-pattern group, cluster columns whose |corr| > threshold
+    (connected components of the correlation graph) and keep, from every
+    cluster, the column with the MOST unique values (most information).
+
+    The legacy greedy version kept whichever column came first, which is
+    arbitrary. Label-free, so fitting on train rows is enough.
+    """
+    kept: List[str] = []
+    for _, group in sorted(groups.items()):
+        if len(group) == 1:
+            kept.extend(group)
+            continue
+        corr = df[group].corr().abs().fillna(0.0).to_numpy()
+        n = len(group)
+        parent = list(range(n))
+
+        def find(i: int) -> int:
+            while parent[i] != i:
+                parent[i] = parent[parent[i]]
+                i = parent[i]
+            return i
+
+        for i in range(n):
+            for j in range(i + 1, n):
+                if corr[i, j] > corr_threshold:
+                    parent[find(i)] = find(j)
+        clusters: Dict[int, List[str]] = defaultdict(list)
+        for i, col in enumerate(group):
+            clusters[find(i)].append(col)
+        for cols in clusters.values():
+            kept.append(max(cols, key=lambda c: df[c].nunique()))
+    kept = sorted(kept, key=lambda c: int(c[1:]))
+    logger.info(
+        "V reduction (most-unique per corr>{} cluster): {} → {} columns.",
+        corr_threshold, sum(len(g) for g in groups.values()), len(kept),
+    )
+    return kept
