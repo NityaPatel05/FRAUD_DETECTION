@@ -67,3 +67,9 @@ results/
 # generated locally, never committed
 catboost_info/
 data/synthetic/
+
+# personal notes / local-only (kept on disk, not on GitHub)
+git_dvc_guide.md
+inference_architecture.md
+walkthrough.md
+mlartifacts.dvc
