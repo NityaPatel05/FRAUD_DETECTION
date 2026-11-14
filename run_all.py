@@ -35,7 +35,15 @@ What happens, in order (each step is an existing project script, so nothing is h
  12  latency      end-to-end decision latency (p50/p95/p99)
  13  sequence     optional GRU sequence-score experiment (needs CUDA torch; skipped if absent)
  14  final        refit on train+val → Kaggle test predictions (submission CSV)
- 15  report       results/FINAL_REPORT.md
+ 15  sim_generate simulated payments world (real-world fields IEEE lacks) → data/synthetic/v1
+ 16  sim_train    train + evaluate on it: per-scenario recall, novel scenario, ring detection
+ 17  report       results/FINAL_REPORT.md
+
+THREE DATASET TRACKS, each run end-to-end, each in its own processes:
+  full  IEEE-CIS, all columns              (best accuracy benchmark on REAL data)
+  raw   IEEE-CIS, real-world fields only   (the model the live system serves)
+  sim   simulated world                    (demonstrates IP/device/merchant/ring features;
+                                            engineering demo, not real-world accuracy)
 
 MEMORY & CHECKPOINTS
   * Every command runs in its OWN Python process. When it ends, the operating system frees
@@ -372,6 +380,13 @@ def build_steps(args, device: str) -> list:
     if not args.skip_sequence:
         S.append(("sequence", False, [[PY, "scripts/run_sequence_experiment.py", "--epochs", "1" if quick else "3", *dev]]))
     S.append(("final", False, [[PY, "scripts/run_training.py", "--final", "--use-tuned", *seeds, *dev]]))
+    if not args.skip_sim:
+        sim_gen = [PY, "scripts/run_simulator.py", "--out", "data/synthetic/v1"]
+        if quick:
+            sim_gen += ["--no-validate"]
+        S.append(("sim_generate", False, [sim_gen]))
+        S.append(("sim_train", False, [[PY, "scripts/run_sim_track.py", "--data", "data/synthetic/v1", *dev]
+                                       + (["--quick"] if quick else [])]))
     return S
 
 
@@ -526,6 +541,23 @@ def build_report(state: dict) -> None:
         L += ["## Optional GRU sequence score", "",
               f"CV AUC-PR {seq['base_cv_ap']:.4f} → {seq['with_seq_cv_ap']:.4f} (gain {seq['gain']:+.4f}) → **{seq['verdict']}**", ""]
 
+    sim = read_json(ROOT / "artifacts" / "v2" / "sim" / "metrics.json")
+    if sim:
+        res["simulated_track"] = sim
+        L += ["## Simulated world (Track C) — engineering demonstration, NOT real-world accuracy", "",
+              f"Val AUC-PR **{fmt(sim['val'].get('auc_pr'))}**, test AUC-PR **{fmt(sim['test'].get('auc_pr'))}** "
+              f"(test recall @1% FPR {fmt(sim['test'].get('recall_at_fpr_1pct'))}); features: {sim.get('n_features')}", "",
+              "| Fraud scenario (test) | Transactions | Recall @1% FPR |", "|---|---|---|"]
+        for sc, v in sim.get("test_by_scenario_at_1pct_fpr", {}).items():
+            if not sc.startswith("_"):
+                novel = " (NOVEL — never in training)" if sc in (sim.get("novel_scenarios") or {}) else ""
+                L.append(f"| {sc}{novel} | {v['n']} | {v['recall_at_1pct_fpr']:.1%} |")
+        rings = sim.get("test_by_scenario_at_1pct_fpr", {}).get("_rings")
+        if rings:
+            L += ["", f"Mule rings detected (≥1 member flagged): **{rings['rings_detected']:.1%}** of "
+                      f"{rings['n_rings']}; ring transactions flagged: {rings['ring_transactions_flagged']:.1%}"]
+        L.append("")
+
     fin = art("causal") / "submission_blend.csv"
     if fin.exists():
         L += ["## Final model", "", f"Refit on train+val; Kaggle test predictions: `{fin.relative_to(ROOT)}` "
@@ -571,6 +603,7 @@ def main():
     ap.add_argument("--skip-ablation", action="store_true")
     ap.add_argument("--skip-latency", action="store_true")
     ap.add_argument("--skip-sequence", action="store_true")
+    ap.add_argument("--skip-sim", action="store_true", help="skip the simulated-world track")
     ap.add_argument("--quiet", action="store_true", help="don't echo step output to the console (still logged)")
     ap.add_argument("--dry-run", action="store_true", help="check setup and print every command without running it")
     ap.add_argument("--no-venv", action="store_true", help="use the current Python instead of creating ./venv")
