@@ -2,7 +2,7 @@
 run_all.py — the ONE file to run on the GPU training machine.
 
 On a fresh machine (only Python 3.11-3.13 + an NVIDIA driver needed):
-    git clone -b improve-aucpr https://github.com/NityaPatel05/FRAUD_DETECTION.git
+    git clone https://github.com/NityaPatel05/FRAUD_DETECTION.git
     cd FRAUD_DETECTION
     python run_all.py                  # creates venv/, installs CUDA torch + requirements, re-runs itself
                                        # inside the venv, gets the data (Kaggle API if data/raw is empty)
