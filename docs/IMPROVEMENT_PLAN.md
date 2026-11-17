@@ -65,7 +65,7 @@ python scripts/run_novelty_monitoring.py
 # Phase 7: decisions & serving
 python scripts/run_policy_simulation.py                    # money, decision rates, review threshold
 python scripts/benchmark_latency.py --n 2000               # p99 target < 50 ms
-uvicorn src.serving.api_v2:app --port 8000                 # POST /v2/score, /v2/label
+uvicorn src.serving.api_v2:app --port 8000                 # POST /v2/score, /v2/label (raw-schema bundle; see docs/SERVING.md)
 
 # Phase 8: feedback loop
 python scripts/run_exploration_simulation.py               # naive vs IPS vs truth

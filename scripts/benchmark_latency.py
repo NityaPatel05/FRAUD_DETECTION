@@ -21,7 +21,7 @@ from src.serving.service_factory import build_service
 
 
 def main(args):
-    svc = build_service(schema=args.schema)
+    svc = build_service(schema=args.schema, allow_full_schema=args.allow_full_schema)
     svc.log = DecisionLog(None)                       # don't pollute the decision log
     val = pd.read_parquet("data/processed/val_raw.parquet").head(args.n)
     lat = {"features": [], "model": [], "rules_policy": [], "total": []}
@@ -40,6 +40,7 @@ def main(args):
 if __name__ == "__main__":
     ap = argparse.ArgumentParser()
     ap.add_argument("--n", type=int, default=2000)
-    ap.add_argument("--schema", choices=["full", "raw"], default=None)
+    ap.add_argument("--schema", choices=["full", "raw"], default=None, help="default: decision_v2.serving_schema (raw)")
+    ap.add_argument("--allow-full-schema", action="store_true", help="replay benchmark on full IEEE columns (not servable live)")
     ap.add_argument("--out", default=None, help="write the latency report as JSON")
     main(ap.parse_args())

@@ -12,21 +12,38 @@ Design
   * Stateful features (velocity, aggregates, EMA, lags, HMM windows, sharing counts,
     delayed labels, identity clusters) are recomputed from compact per-entity state:
     READ the state as it was before this event, then UPDATE it.
-  * Labels are registered when they arrive (record_label) and only count once they are
-    older than label_delay_days — the same rule the training features used.
+  * Labels follow the shared policy in src/labels/policy.py (meta["label_policy"]):
+      - every scored transaction registers a MATURITY event at t + maturity_days; at that time it
+        counts as a labelled row (n) -- a mature transaction with no fraud report is a negative;
+      - record_label(txn_id, 1) (a chargeback) registers FRAUD events at the time the policy says
+        the label is known (t + fraud_delay(txn_id)); no explicit negatives are ever needed;
+      - events are popped from one global heap when the clock (event time of the next scored
+        transaction) reaches them, so features equal the offline vectorised ones exactly.
+  * Concurrency: one re-entrant engine lock serialises every state read/update (feature
+    computation is ~1-3 ms of pure Python, so throughput is bounded to ~1/latency on one core;
+    scale out by sharding on uid, not by threads). Row-level preprocessing and model inference
+    run outside the lock.
+  * Idempotency: a TransactionID already scored never mutates state again (see featurize).
+  * Bounded state: windows are dropped when idle, idle entity profiles after profile_ttl_days,
+    the txn index after the longest label delay, the decision cache by size (see prune()).
   * Only agg_mode = causal is servable (transductive needs the future).
 
 Usage
     eng = OnlineFeatureEngine(meta)                  # meta.json from run_feature_engineering
     eng.replay(history_raw_df, labels=True)          # warm state from history (time-sorted)
     x = eng.transform(txn_dict)                      # → pd.Series in meta["feature_cols"] order
-    eng.record_label(txn_id, is_fraud)               # when the chargeback / analyst label lands
+    eng.record_label(txn_id, 1)                      # when a chargeback lands (fraud only)
 """
 from __future__ import annotations
 
+import hashlib
 import heapq
+import json
 import math
-from collections import defaultdict, deque
+import os
+import pickle
+import threading
+from collections import OrderedDict, defaultdict, deque
 from typing import Dict, Iterable, List, Optional
 
 import numpy as np
@@ -41,7 +58,9 @@ from src.feature_engineering.derived_signals import add_derived_signals
 from src.feature_engineering.graph_features import SHARED_ENTITY_PAIRS
 from src.feature_engineering.hmm_features import HMM_PERSPECTIVES, hmm_surprise_from_window
 from src.feature_engineering.label_history import LABEL_KEYS
+from src.feature_engineering.derived_signals import vendor_engineered_cols
 from src.feature_engineering.pipeline_v2 import _downcast
+from src.labels.policy import DAY, LabelPolicy, fraud_known_at, maturity_at
 
 _FE_MODULES = ["src.feature_engineering.base_features", "src.feature_engineering.client_features",
                "src.feature_engineering.derived_signals"]
@@ -120,22 +139,34 @@ class _Agg:
         return math.sqrt(max(var, 0.0))
 
 
-class _Delayed:
-    """Labels of one entity that count only once matured (event_t + delay <= now)."""
-    __slots__ = ("pending", "n", "f")
+class _Ctr:
+    """Label counters of one entity: n = mature rows, f = known frauds, fm = known frauds that are mature."""
+    __slots__ = ("n", "f", "fm")
 
     def __init__(self):
-        self.pending: list = []; self.n = 0.0; self.f = 0.0
+        self.n = 0.0; self.f = 0.0; self.fm = 0.0
 
-    def mature(self, now):
-        while self.pending and self.pending[0][0] <= now:
-            _, y = heapq.heappop(self.pending); self.n += 1; self.f += y
+
+_EV_MATURE, _EV_FRAUD, _EV_FRAUD_MATURE = 0, 1, 2
+
+
+class DuplicateTransactionError(ValueError):
+    """The TransactionID was already scored: state must not be mutated twice."""
+
+
+class SnapshotMismatchError(RuntimeError):
+    """Engine snapshot was written for a different model / meta / feature list / label policy."""
+
+
+class MissingFieldsError(ValueError):
+    """The bundle needs input fields the gateway did not send (e.g. Vesta-only columns)."""
 
 
 class _DSU:
     def __init__(self):
         self.parent, self.size, self.fraud, self.lab = {}, {}, defaultdict(float), defaultdict(float)
         self.deg = defaultdict(float)
+        self.fraud_m = defaultdict(float)
 
     def find(self, x):
         if x not in self.parent:
@@ -156,21 +187,63 @@ class _DSU:
             ra, rb = rb, ra
         self.parent[rb] = ra
         self.size[ra] += self.size[rb]; self.fraud[ra] += self.fraud[rb]; self.lab[ra] += self.lab[rb]
+        self.fraud_m[ra] += self.fraud_m[rb]
+
+
+def resolve_policy(meta: Dict) -> LabelPolicy:
+    """The label policy the features were BUILT with (meta) -- never a serving-side guess."""
+    if meta.get("label_policy"):
+        return LabelPolicy.from_cfg(meta["label_policy"])
+    if meta["fe_cfg"].get("label_policy"):
+        return LabelPolicy.from_cfg(meta["fe_cfg"]["label_policy"])
+    if meta["fe_cfg"].get("label_delay_days"):           # pre-policy meta: fixed delay for every label
+        return LabelPolicy.fixed(float(meta["fe_cfg"]["label_delay_days"]))
+    raise ValueError("meta has no label_policy: rebuild the features (run_feature_engineering)")
+
+
+def _hash(obj) -> str:
+    return hashlib.sha256(json.dumps(obj, sort_keys=True, default=str).encode()).hexdigest()[:16]
 
 
 class OnlineFeatureEngine:
-    def __init__(self, meta: Dict):
+    """serving: optional dict -- profile_ttl_days (400), prune_every (txns between sweeps, 20000),
+    decision_cache_size (100000), label_grace_days (30), require_vendor_fields (True)."""
+
+    def __init__(self, meta: Dict, serving: Optional[Dict] = None):
         if meta["agg_mode"] != "causal":
             raise ValueError("Only agg_mode=causal features can be served online")
         self.meta = meta
         self.cfg = meta["fe_cfg"]
         self.feature_cols: List[str] = meta["feature_cols"]
-        self.delay = int(self.cfg["label_delay_days"] * 86400)
+        self.policy = resolve_policy(meta)
         self.smooth = float(self.cfg["label_smoothing"])
         self.prior = float(meta["train_fraud_rate"])
         self.cat_index = {c: {v: i for i, v in enumerate(cats)} for c, cats in meta["label_maps"].items()}
         self.hmm = {k: tuple(np.asarray(a, dtype=np.float64) for a in v) for k, v in meta.get("hmm_params", {}).items()}
+        sv = dict(serving or {})
+        longest_window = max([int(w) for w in self.cfg["velocity_windows_sec"]] + [30 * DAY, int(self.cfg["count_window_days"]) * DAY])
+        self.window_ttl = longest_window + DAY                        # idle longer than this => every window is empty
+        ptl = sv.get("profile_ttl_days", 400)
+        self.profile_ttl = None if ptl is None else max(int(float(ptl) * DAY), self.window_ttl)
+        self.prune_every = int(sv.get("prune_every", 20000))
+        self.decision_cache_size = int(sv.get("decision_cache_size", 100_000))
+        self.index_ttl = int((max(self.policy.delay_cap_days, self.policy.maturity_days)
+                              + float(sv.get("label_grace_days", 30))) * DAY)
+        # Vesta-only columns a real gateway never sends (only relevant for schema=full bundles)
+        self.vendor_fields = vendor_engineered_cols(meta["raw_columns"]) if meta.get("schema") == "full" else []
+        self.require_vendor = bool(sv.get("require_vendor_fields", True))
+        self._lock = threading.RLock()
         self._reset_state()
+
+    # ── fingerprint (snapshot validation) ────────────────────────────────────
+    def fingerprint(self) -> Dict:
+        m = self.meta
+        return {"feature_cols": _hash(self.feature_cols), "raw_columns": _hash(m["raw_columns"]),
+                "label_policy": _hash(self.policy.to_dict()),
+                "fe_cfg": _hash({k: v for k, v in self.cfg.items() if k != "drop_cols"}),
+                "label_maps": _hash({k: list(v) for k, v in m["label_maps"].items()}),
+                "hmm": _hash({k: [np.asarray(a).tolist() for a in v] for k, v in m.get("hmm_params", {}).items()}),
+                "prior": round(float(m["train_fraud_rate"]), 12), "schema": m.get("schema"), "tag": m.get("tag")}
 
     # ── state ────────────────────────────────────────────────────────────────
     def _reset_state(self):
@@ -184,11 +257,18 @@ class OnlineFeatureEngine:
         self.ema = {}                  # (uid, hl) -> [c, s, s2, last]
         self.hmm_x = dd(_deque2)       # (persp, obs, key) -> last 2 x
         self.hmm_last_t = {}           # (persp, key) -> previous t
-        self.delayed = dd(_Delayed)    # (ns, key) -> _Delayed
+        self.delayed = dd(_Ctr)        # (ns, key) -> label counters (n, f, fm)
         self.dsu = _DSU()
-        self.dsu_pending: list = []    # heap of (mature_t, seq, client_node, y)
+        self.events: list = []         # heap (ready_t, seq, kind, keys, uid): maturity / fraud-known events
         self.browser_newest: Dict = {}
-        self.txn_keys: Dict = {}       # txn_id -> (t, {ns: key}) for record_label
+        self.txn_keys: Dict = {}       # txn_id -> (t, {ns: key}, uid): the TTL-bounded transaction index
+        self.index_order: deque = deque()   # (t, txn_id) in arrival order, for TTL pruning
+        self.fraud_ids: set = set()    # txn ids whose fraud label was registered (idempotent labels)
+        self.decisions: OrderedDict = OrderedDict()   # txn_id -> decision (idempotent re-scoring)
+        self.touched: OrderedDict = OrderedDict()      # entity key value -> last event time
+        self.clock = 0                 # largest event time seen
+        self.n_scored = 0
+        self.label_stats: Dict[str, int] = defaultdict(int)
         self._seq = 0
 
     # ── row-level (shared with offline) ──────────────────────────────────────
@@ -238,9 +318,37 @@ class OnlineFeatureEngine:
         return float("nan") if not prior else float(new)
 
     # ── one event ────────────────────────────────────────────────────────────
-    def _stateful(self, r: Dict) -> Dict[str, float]:
+    def _apply_events(self, now: int) -> None:
+        """Count every label event that is due (ready_t <= now), exactly like the offline `ready <= t`."""
+        ev = self.events
+        use_dsu = self.cfg.get("use_network_v4", True)
+        while ev and ev[0][0] <= now:
+            _, _, kind, keys, uid = heapq.heappop(ev)
+            for ns, k in keys.items():
+                if k is not None:
+                    c = self.delayed[(ns, k)]
+                    if kind == _EV_MATURE:
+                        c.n += 1
+                    elif kind == _EV_FRAUD:
+                        c.f += 1
+                    else:
+                        c.fm += 1
+            if use_dsu and uid is not None:
+                rt = self.dsu.find(("c", uid))
+                if kind == _EV_MATURE:
+                    self.dsu.lab[rt] += 1
+                elif kind == _EV_FRAUD:
+                    self.dsu.fraud[rt] += 1
+                else:
+                    self.dsu.fraud_m[rt] += 1
+
+    def _stateful(self, r: Dict, labelled: bool = True) -> Dict[str, float]:
+        """Features of one event from state BEFORE it, then update state. ``labelled=False`` (offline
+        replay of unlabelled rows, e.g. Kaggle test) skips the maturity event: such rows never count."""
         out: Dict[str, float] = {}
         t = int(r["TransactionDT"]); amt = float(r["TransactionAmt"])
+        self.clock = max(self.clock, t)
+        self._apply_events(t)
         has = r.__contains__
         uid = _key(r.get("uid1"))
         cfg = self.cfg
@@ -417,7 +525,7 @@ class OnlineFeatureEngine:
                 k = keys[key_col]
                 prev_t = self.hmm_last_t.get((ptag, k)) if k is not None else None
                 xs = {"amt": math.log1p(amt),
-                      "gap": math.log1p((t - prev_t) / 3600.0) if prev_t is not None else float("nan")}
+                      "gap": math.log1p(max(t - prev_t, 0) / 3600.0) if prev_t is not None else float("nan")}
                 for obs, x in xs.items():
                     name = f"{ptag}_{obs}"
                     if name not in self.hmm:
@@ -448,9 +556,9 @@ class OnlineFeatureEngine:
         # network v4 + label history need matured labels first
         def delayed(ns, key):
             if key is None:
-                return float("nan"), float("nan")
-            d = self.delayed[(ns, key)]; d.mature(t)
-            return d.n, d.f
+                return float("nan"), float("nan"), float("nan")
+            d = self.delayed[(ns, key)]
+            return d.n, d.f, d.fm
 
         if cfg.get("use_network_v4", True):
             for ent in ["device_fp", "card1_addr1"]:
@@ -478,16 +586,13 @@ class OnlineFeatureEngine:
                     out[f"{ent}_new_links_1d"] = ww.s
                 else:
                     out[f"{ent}_age_days"] = out[f"{ent}_new_links_1d"] = float("nan")
-                en, ef = delayed("lbl_" + ent, ek)
-                pn, pf = delayed("pairlbl_" + ent, pair) if pair is not None else (0.0, 0.0)
-                on, of = en - pn, ef - pf
+                en, ef, efm = delayed("lbl_" + ent, ek)
+                pn, pf, pfm = delayed("pairlbl_" + ent, pair) if pair is not None else (0.0, 0.0, 0.0)
+                on, of, ofm = en - pn, ef - pf, efm - pfm
                 out[f"{ent}_other_clients_lbl_fraud"] = of
-                out[f"{ent}_other_clients_lbl_rate"] = (of + self.smooth * self.prior) / (on + self.smooth)
+                out[f"{ent}_other_clients_lbl_rate"] = (ofm + self.smooth * self.prior) / (on + self.smooth)
             # identity clusters (union-find with hub cap, matured labels)
             if "device_fp" in keys:
-                while self.dsu_pending and self.dsu_pending[0][0] <= t:
-                    _, _, cnode, y = heapq.heappop(self.dsu_pending)
-                    rt = self.dsu.find(cnode); self.dsu.lab[rt] += 1; self.dsu.fraud[rt] += y
                 dk = keys["device_fp"]
                 if uid is None:
                     for k_ in ["cluster_n_clients", "cluster_lbl_fraud", "cluster_lbl_rate", "cluster_merges_identities"]:
@@ -506,7 +611,7 @@ class OnlineFeatureEngine:
                             merge = 1.0
                     out["cluster_n_clients"] = self.dsu.size[rc]
                     out["cluster_lbl_fraud"] = self.dsu.fraud[rc]
-                    out["cluster_lbl_rate"] = (self.dsu.fraud[rc] + self.smooth * self.prior) / (self.dsu.lab[rc] + self.smooth)
+                    out["cluster_lbl_rate"] = (self.dsu.fraud_m[rc] + self.smooth * self.prior) / (self.dsu.lab[rc] + self.smooth)
                     out["cluster_merges_identities"] = merge
                     if dk is not None:
                         self.dsu.deg[dk] += newp
@@ -526,9 +631,9 @@ class OnlineFeatureEngine:
         if cfg.get("use_label_history", True):
             for k in LABEL_KEYS:
                 if k in keys:
-                    n, f = delayed("lh_" + k, keys[k])
+                    n, f, fm = delayed("lh_" + k, keys[k])
                     out[f"{k}_lbl_n"], out[f"{k}_lbl_fraud"] = n, f
-                    out[f"{k}_lbl_rate"] = (f + self.smooth * self.prior) / (n + self.smooth) if not math.isnan(n) else float("nan")
+                    out[f"{k}_lbl_rate"] = (fm + self.smooth * self.prior) / (n + self.smooth) if not math.isnan(n) else float("nan")
 
         # ── UPDATE shared per-entity state after all reads ───────────────────
         for v in FIRST_SEEN_VALUES:
@@ -551,22 +656,126 @@ class OnlineFeatureEngine:
         txn_keys.update({f"pairlbl_{e}": (keys[e], uid) for e in ["device_fp", "card1_addr1"]
                          if keys.get(e) is not None and uid is not None})
         txn_keys.update({f"lh_{k}": keys.get(k) for k in LABEL_KEYS if k in keys})
-        self.txn_keys[r["TransactionID"]] = (t, txn_keys, uid)
+        tid = r["TransactionID"]
+        self.txn_keys[tid] = (t, txn_keys, uid)
+        self.index_order.append((t, tid))
+        self.n_scored += 1
+        if labelled:       # every scored txn becomes a (mostly negative) labelled row once mature
+            self._seq += 1
+            heapq.heappush(self.events, (int(maturity_at(t, self.policy)), self._seq, _EV_MATURE, txn_keys, uid))
+        # last-touch order of every entity this event touched (drives TTL pruning)
+        tch = self.touched
+        for k in [uid, *keys.values()]:
+            if k is not None:
+                tch[k] = t
+                tch.move_to_end(k)
         return out
+
+    # ── bounded state ────────────────────────────────────────────────────────
+    def prune(self, now: Optional[int] = None) -> Dict[str, int]:
+        """Drop state that can no longer influence any feature (exact) or exceeds its TTL.
+
+        1. windows idle for more than the longest window are empty -> deleted       (exact)
+        2. txn index / fraud-id set older than the longest label delay + grace are dropped
+           (a label arriving later is reported 'unknown_transaction')                (policy)
+        3. decision cache trimmed to its size bound                                (policy)
+        4. entities idle for more than profile_ttl_days lose their profile state    (approximate:
+           they look new again; ttl >= longest window so in-window features stay exact)
+        O(state); called every ``prune_every`` scored transactions, under the engine lock."""
+        with self._lock:
+            now = self.clock if now is None else int(now)
+            before = sum(self.state_size().values())
+            # 1. windows
+            for k in list(self.win):
+                d = self.win[k]
+                for w in list(d):
+                    d[w].evict(now)
+                    if not d[w].q:
+                        del d[w]
+                if not d:
+                    del self.win[k]
+            # 2. txn index
+            cut = now - self.index_ttl
+            while self.index_order and self.index_order[0][0] < cut:
+                _, tid = self.index_order.popleft()
+                self.txn_keys.pop(tid, None); self.fraud_ids.discard(tid)
+            # 3. decision cache
+            while len(self.decisions) > self.decision_cache_size:
+                self.decisions.popitem(last=False)
+            # 4. idle entity profiles
+            if self.profile_ttl is not None:
+                self._evict_idle_profiles(now - self.profile_ttl)
+            sizes = self.state_size()
+            return {"before": before, "after": sum(sizes.values()), **sizes}
+
+    def _evict_idle_profiles(self, cutoff: int) -> None:
+        tch = self.touched
+        stale = set()
+        for k, t in tch.items():                      # LRU order: oldest first
+            if t >= cutoff:
+                break
+            stale.add(k)
+        if not stale:
+            return
+
+        def dead(key) -> bool:
+            if isinstance(key, tuple):
+                return any(x in stale for x in key)
+            return key in stale
+
+        for d in (self.agg, self.seen, self.count, self.delayed, self.win, self.first_t):
+            for k in [k for k in d if dead(k[1])]:
+                del d[k]
+        for k in [k for k in self.ema if k[0] in stale]:
+            del self.ema[k]
+        for k in [k for k in self.hist if k in stale]:
+            del self.hist[k]
+        for k in [k for k in self.hmm_x if k[2] in stale]:
+            del self.hmm_x[k]
+        for k in [k for k in self.hmm_last_t if k[1] in stale]:
+            del self.hmm_last_t[k]
+        for k in stale:
+            del tch[k]
+
+    def state_size(self) -> Dict[str, int]:
+        return {"win": len(self.win), "agg": len(self.agg), "seen": len(self.seen), "count": len(self.count),
+                "first_t": len(self.first_t), "hist": len(self.hist), "ema": len(self.ema),
+                "hmm": len(self.hmm_x) + len(self.hmm_last_t), "labels": len(self.delayed),
+                "events": len(self.events), "txn_index": len(self.txn_keys), "decisions": len(self.decisions),
+                "touched": len(self.touched), "dsu": len(self.dsu.parent)}
 
     # ── state persistence (snapshot; Redis-backed store is the production upgrade) ──
     _STATE = ["win", "agg", "seen", "count", "first_t", "hist", "ema", "hmm_x", "hmm_last_t",
-              "delayed", "dsu", "dsu_pending", "browser_newest", "txn_keys", "_seq"]
+              "delayed", "dsu", "events", "browser_newest", "txn_keys", "index_order", "fraud_ids",
+              "decisions", "touched", "clock", "n_scored", "label_stats", "_seq"]
+    SNAPSHOT_FORMAT = 3
 
-    def save_state(self, path) -> None:
-        import pickle
-        with open(path, "wb") as f:
-            pickle.dump({k: getattr(self, k) for k in self._STATE}, f, protocol=pickle.HIGHEST_PROTOCOL)
+    def save_state(self, path, extra: Optional[Dict] = None) -> None:
+        """Atomic snapshot + fingerprint (engine meta/feature list/label policy + caller's ``extra``,
+        e.g. the model bundle fingerprint). load_state refuses a snapshot whose fingerprint differs."""
+        with self._lock:
+            blob = {"_format": self.SNAPSHOT_FORMAT, "_fingerprint": self.fingerprint(), "_extra": extra or {},
+                    "state": {k: getattr(self, k) for k in self._STATE}}
+            tmp = f"{path}.tmp{os.getpid()}"
+            with open(tmp, "wb") as f:
+                pickle.dump(blob, f, protocol=pickle.HIGHEST_PROTOCOL)
+            os.replace(tmp, path)
 
-    def load_state(self, path) -> None:
-        import pickle
+    def load_state(self, path, expect_extra: Optional[Dict] = None) -> None:
         with open(path, "rb") as f:
-            for k, v in pickle.load(f).items():
+            blob = pickle.load(f)
+        if not isinstance(blob, dict) or blob.get("_format") != self.SNAPSHOT_FORMAT:
+            raise SnapshotMismatchError(f"{path}: unknown snapshot format (pre-validation snapshot?); rebuild it")
+        mine = self.fingerprint()
+        diff = sorted(k for k in set(mine) | set(blob["_fingerprint"]) if mine.get(k) != blob["_fingerprint"].get(k))
+        if expect_extra is not None:
+            diff += [f"extra.{k}" for k in sorted(set(expect_extra) | set(blob["_extra"]))
+                     if expect_extra.get(k) != blob["_extra"].get(k)]
+        if diff:
+            raise SnapshotMismatchError(f"{path}: snapshot does not match the loaded model/meta ({', '.join(diff)}); "
+                                        "rebuild it by replaying history")
+        with self._lock:
+            for k, v in blob["state"].items():
                 setattr(self, k, v)
 
     # ── public API ───────────────────────────────────────────────────────────
@@ -579,43 +788,108 @@ class OnlineFeatureEngine:
             vals[c] = np.nan if _isnan(v) else float(v)
         return pd.Series(vals, dtype=np.float64)
 
-    def transform(self, txn: Dict) -> pd.Series:
-        """Features for ONE new transaction (state is updated: it now counts as history)."""
+    def check_fields(self, txn: Dict) -> None:
+        """Schema=full bundles need Vesta-only fields no real gateway sends: fail loudly, not silently NaN."""
+        if self.vendor_fields and self.require_vendor:
+            norm = {str(k).replace("id-", "id_") for k in txn}
+            missing = [c for c in self.vendor_fields if c not in norm]
+            if len(missing) > 0.5 * len(self.vendor_fields):
+                raise MissingFieldsError(
+                    f"this bundle uses schema=full and needs {len(self.vendor_fields)} Vesta-only fields "
+                    f"(V*, C*, D2-D15, id_01-id_11) that the request lacks (e.g. {missing[:5]}). "
+                    "Serve the raw-schema bundle (decision_v2.serving_schema: raw).")
+
+    def featurize(self, txn: Dict, labelled: bool = True):
+        """-> (row dict, features Series). Thread-safe; raises DuplicateTransactionError for a known id
+        (no state change). The expensive row-level preprocessing runs outside the lock."""
+        self.check_fields(txn)
         rf = self.row_frame(pd.DataFrame([txn]))
         r = rf.iloc[0].to_dict()
-        st = self._stateful(r)
-        return self._encode(rf.iloc[0], st)
+        with self._lock:
+            if r["TransactionID"] in self.txn_keys:
+                self.label_stats["duplicate_scores"] += 1
+                raise DuplicateTransactionError(f"TransactionID {r['TransactionID']} was already scored")
+            st = self._stateful(r, labelled)
+            x = self._encode(rf.iloc[0], st)
+            if self.prune_every and self.n_scored % self.prune_every == 0:
+                self.prune()
+        return r, x
 
-    def record_label(self, txn_id, is_fraud: float) -> None:
-        """Register a label; it is counted only once the transaction is label_delay old."""
-        if txn_id not in self.txn_keys or _isnan(is_fraud):
-            return
-        t, keys, uid = self.txn_keys[txn_id]
-        mature = t + self.delay
-        for ns, k in keys.items():
-            if k is not None:
-                heapq.heappush(self.delayed[(ns, k)].pending, (mature, float(is_fraud)))
-        if uid is not None:
+    def transform(self, txn: Dict) -> pd.Series:
+        """Features for ONE new transaction (state is updated: it now counts as history)."""
+        return self.featurize(txn)[1]
+
+    # ── decision cache (idempotent re-scoring) ───────────────────────────────
+    def cached_decision(self, txn_id):
+        with self._lock:
+            return self.decisions.get(txn_id)
+
+    def cache_decision(self, txn_id, rec: Dict) -> None:
+        with self._lock:
+            self.decisions[txn_id] = rec
+            while len(self.decisions) > self.decision_cache_size:
+                self.decisions.popitem(last=False)
+
+    # ── labels ───────────────────────────────────────────────────────────────
+    def record_label(self, txn_id, is_fraud: float, known_at: Optional[int] = None) -> str:
+        """A chargeback / confirmed-fraud report. Returns a status string:
+          registered          fraud label queued; counts once its (policy) known-time is reached
+          already_registered  idempotent repeat
+          negative_ignored    is_fraud=0: nothing to do, a mature unreported txn IS a negative
+          unknown_transaction never scored here, or older than the label TTL (counted + logged)
+          invalid             NaN label
+        ``known_at`` (epoch seconds in TransactionDT units) overrides the policy's chargeback date
+        (real feed); default = t + fraud_delay(txn_id), which is what offline features assumed."""
+        with self._lock:
+            if _isnan(is_fraud):
+                self.label_stats["invalid"] += 1
+                return "invalid"
+            if float(is_fraud) != 1.0:
+                self.label_stats["negative_ignored"] += 1
+                return "negative_ignored"
+            ent = self.txn_keys.get(txn_id)
+            if ent is None:
+                self.label_stats["unknown_transaction"] += 1
+                logger.warning("label for unknown/expired TransactionID {} dropped (count={})",
+                               txn_id, self.label_stats["unknown_transaction"])
+                return "unknown_transaction"
+            if txn_id in self.fraud_ids:
+                self.label_stats["already_registered"] += 1
+                return "already_registered"
+            t, keys, uid = ent
+            fk = int(fraud_known_at(txn_id, t, self.policy)) if known_at is None else int(known_at)
+            fm = max(fk, int(maturity_at(t, self.policy)))
             self._seq += 1
-            heapq.heappush(self.dsu_pending, (mature, self._seq, ("c", uid), float(is_fraud)))
+            heapq.heappush(self.events, (fk, self._seq, _EV_FRAUD, keys, uid))
+            heapq.heappush(self.events, (fm, self._seq, _EV_FRAUD_MATURE, keys, uid))
+            self.fraud_ids.add(txn_id)
+            self.label_stats["registered"] += 1
+            return "registered"
 
     def replay(self, raw: pd.DataFrame, labels: bool = True, collect: bool = True,
                batch: int = 50_000) -> Optional[pd.DataFrame]:
         """Run history through the engine in time order (warm-up and parity checks).
 
-        Row-level features are computed vectorised per batch with the offline code;
-        stateful features event by event. If labels=True, each labelled row's label is
-        registered right after the row (it still only counts after the delay)."""
+        Row-level features are computed vectorised per batch with the offline code; stateful
+        features event by event. If labels=True, only FRAUD labels (isFraud == 1) are posted, right
+        after the row (a chargeback feed); known-time comes from the label policy. Rows whose isFraud
+        is NaN are unlabelled and never count (like offline Kaggle-test rows). Already-scored ids are skipped."""
         raw = raw.sort_values(["TransactionDT", "TransactionID"], kind="mergesort")
         out_rows = []
         for s0 in range(0, len(raw), batch):
             rf = self.row_frame(raw.iloc[s0:s0 + batch].reset_index(drop=True))
-            ys = raw["isFraud"].iloc[s0:s0 + batch].to_numpy() if (labels and "isFraud" in raw.columns) else None
+            ys = raw["isFraud"].iloc[s0:s0 + batch].to_numpy(dtype=np.float64) if "isFraud" in raw.columns else None
             recs = rf.to_dict("records")
-            for i, r in enumerate(recs):
-                st = self._stateful(r)
-                if collect:
-                    out_rows.append(self._encode(rf.iloc[i], st))
-                if ys is not None:
-                    self.record_label(r["TransactionID"], ys[i])
+            with self._lock:
+                for i, r in enumerate(recs):
+                    if r["TransactionID"] in self.txn_keys:
+                        continue
+                    lab = (ys is None or not np.isnan(ys[i])) if labels else True
+                    st = self._stateful(r, labelled=bool(lab))
+                    if collect:
+                        out_rows.append(self._encode(rf.iloc[i], st))
+                    if labels and ys is not None and ys[i] == 1:
+                        self.record_label(r["TransactionID"], 1.0)
+                    if self.prune_every and self.n_scored % self.prune_every == 0:
+                        self.prune()
         return pd.DataFrame(out_rows).reset_index(drop=True) if collect else None

@@ -297,6 +297,12 @@ decision_v2:
   rules_file:                  "artifacts/v2/novelty/active_rules.yaml"
   lists_file:                  "artifacts/v2/decisions/lists.yaml"   # allow/block lists
   state_snapshot:              "artifacts/v2/decisions/engine_state.pkl"
+  serving_schema:              raw        # raw = fields a real gateway sends (served); full needs Vesta-only columns
+  state:                                      # online engine state bounds (src/serving/online_features.py)
+    profile_ttl_days:          400        # idle entity profiles dropped after this (>= longest window)
+    prune_every:               20000      # scored txns between prune sweeps (O(state), under the engine lock)
+    decision_cache_size:       100000     # idempotent re-score cache
+    label_grace_days:          30         # keep the txn index max(delay cap, maturity)+grace days for late chargebacks
 
 # ══════════════════════════════════════════════════════════════════════════════
 #  Phase 8 — feedback loop & safe deployment (src/feedback/, src/jobs/retrain_v2.py)

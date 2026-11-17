@@ -14,8 +14,11 @@ Layered decisioning as in Stripe Radar / Adyen / Sift / Nubank:
 """
 from __future__ import annotations
 
+import hashlib
 import json
+import threading
 import time
+from collections import OrderedDict
 from pathlib import Path
 from typing import Dict, List, Optional
 
@@ -23,7 +26,8 @@ import numpy as np
 import pandas as pd
 
 from src.novelty.rules_engine import evaluate_rules_row, load_rules
-from src.serving.online_features import OnlineFeatureEngine
+from src.labels.policy import LabelPolicy
+from src.serving.online_features import DuplicateTransactionError, OnlineFeatureEngine
 from src.training.blending import CalibratedRankBlender
 
 # Readable reason templates by feature family / prefix (first match wins)
@@ -69,11 +73,21 @@ class ModelBundle:
         self.spec = json.loads((self.dir / f"bundle_{kind}.json").read_text())
         self.features: List[str] = self.spec["features"]
         self.cat_cols: List[str] = self.spec["cat_cols"]
+        # models were trained on float32 frames: cast online features the same way so split decisions match
+        self.dtype = np.dtype(self.spec.get("feature_dtype", "float32"))
         self.blender = CalibratedRankBlender.load(self.dir / self.spec["blender"])
         self.models: Dict[str, list] = {}
         for name, files in self.spec["model_files"].items():
             self.models[name] = [self._load(name, self.dir / f) for f in files]
         self.version = f"{self.spec['tag']}:{kind}:{int((self.dir / self.spec['blender']).stat().st_mtime)}"
+
+    def fingerprint(self) -> str:
+        """Identity of the model for snapshot validation: features, files, tag, label policy."""
+        blob = {k: self.spec.get(k) for k in ("tag", "features", "cat_cols", "model_files", "blender", "label_policy")}
+        return hashlib.sha256(json.dumps(blob, sort_keys=True, default=str).encode()).hexdigest()[:16]
+
+    def label_policy(self) -> Optional[LabelPolicy]:
+        return LabelPolicy.from_cfg(self.spec["label_policy"]) if self.spec.get("label_policy") else None
 
     @staticmethod
     def _load(name, path):
@@ -89,6 +103,7 @@ class ModelBundle:
         m = CatBoostClassifier(); m.load_model(str(path)); return m
 
     def _predict(self, name, model, X: pd.DataFrame) -> np.ndarray:
+        X = X.astype(self.dtype)
         if name == "lgbm":
             return model.predict(X)
         if name == "catboost":
@@ -105,6 +120,7 @@ class ModelBundle:
         """TreeSHAP (LightGBM pred_contrib) top positive contributions per row."""
         if "lgbm" not in self.models:
             return [[] for _ in range(len(X))]
+        X = X.astype(self.dtype)
         contrib = self.models["lgbm"][0].predict(X, pred_contrib=True)[:, :-1]
         out = []
         for i in range(len(X)):
@@ -155,17 +171,39 @@ class DecisionLog:
 
 
 class DecisionService:
+    """Thread-safe, idempotent decision service.
+
+    Concurrency: engine state is serialised by the engine lock (feature step only, ~1-3 ms);
+    model inference, rules and policy run outside it, in parallel across request threads.
+    Idempotency: the same TransactionID returns the cached decision (``idempotent_replay``) and
+    never touches state; concurrent requests for one id wait for the first to finish.
+    """
+
     def __init__(self, engine: OnlineFeatureEngine, bundle: ModelBundle, policy: CostPolicy,
                  rules: Optional[List[Dict]] = None, lists: Optional[Dict] = None,
                  log: Optional[DecisionLog] = None, challenger: Optional[ModelBundle] = None,
-                 use_client_smoothing: bool = False):
+                 use_client_smoothing: bool = False, smoothing_cache_size: int = 500_000):
         self.engine, self.bundle, self.policy = engine, bundle, policy
         self.rules = rules or []
         self.lists = lists or {"allow": {}, "block": {}}       # {"block": {"device_fp": {...}, ...}}
         self.log = log or DecisionLog(None)
         self.challenger = challenger
         self.smooth = use_client_smoothing
-        self._client_scores: Dict = {}
+        self._client_scores: "OrderedDict" = OrderedDict()
+        self._smooth_cap = smoothing_cache_size
+        self._smooth_lock = threading.Lock()
+        self._inflight: Dict = {}
+        self._inflight_lock = threading.Lock()
+        for name, b in (("champion", bundle), ("challenger", challenger)):
+            if b is None:
+                continue
+            missing = [f for f in b.features if f not in engine.feature_cols]
+            if missing:
+                raise ValueError(f"{name} bundle needs features the engine does not produce: {missing[:5]}")
+            pol = b.label_policy() if hasattr(b, "label_policy") else None
+            if pol is not None and pol.to_dict() != engine.policy.to_dict():
+                raise ValueError(f"{name} bundle was trained under a different label policy than the serving "
+                                 f"features ({pol.to_dict()} vs {engine.policy.to_dict()})")
 
     def _listed(self, kind: str, row: Dict) -> Optional[str]:
         for field, values in self.lists.get(kind, {}).items():
@@ -174,22 +212,51 @@ class DecisionService:
                 return f"{kind}list:{field}"
         return None
 
-    def decide(self, txn: Dict) -> Dict:
-        t0 = time.perf_counter()
-        rf = self.engine.row_frame(pd.DataFrame([txn]))
-        row = rf.iloc[0].to_dict()
-        st = self.engine._stateful(row)                       # features use history BEFORE this txn
-        x = self.engine._encode(rf.iloc[0], st)
-        t_feat = time.perf_counter()
-
-        X = x[self.bundle.features].to_frame().T.astype(np.float64)
-        p = float(self.bundle.predict_proba(X)[0])
-        uid = row.get("uid1")
-        if self.smooth and uid is not None:                    # causal running mean per client
-            s, n = self._client_scores.get(uid, (0.0, 0))
+    def _smoothed(self, uid, p: float) -> float:
+        with self._smooth_lock:                                # causal running mean per client
+            s, n = self._client_scores.pop(uid, (0.0, 0))
             s, n = s + p, n + 1
             self._client_scores[uid] = (s, n)
-            p = 0.5 * p + 0.5 * s / n
+            while len(self._client_scores) > self._smooth_cap:
+                self._client_scores.popitem(last=False)
+        return 0.5 * p + 0.5 * s / n
+
+    def decide(self, txn: Dict) -> Dict:
+        txid = txn.get("TransactionID")
+        hit = self.engine.cached_decision(txid)
+        if hit is not None:
+            return {**hit, "idempotent_replay": True}
+        with self._inflight_lock:
+            ev = self._inflight.get(txid)
+            owner = ev is None
+            if owner:
+                ev = self._inflight[txid] = threading.Event()
+        if not owner:                                          # same id in flight: wait, return its decision
+            ev.wait(timeout=30)
+            hit = self.engine.cached_decision(txid)
+            if hit is None:
+                raise DuplicateTransactionError(
+                    f"TransactionID {txid} is being scored / was scored without a cached decision")
+            return {**hit, "idempotent_replay": True}
+        try:
+            rec = self._decide(txn)
+            self.engine.cache_decision(txid, rec)
+            return rec
+        finally:
+            with self._inflight_lock:
+                self._inflight.pop(txid, None)
+            ev.set()
+
+    def _decide(self, txn: Dict) -> Dict:
+        t0 = time.perf_counter()
+        row, x = self.engine.featurize(txn)                   # features use history BEFORE this txn (locked)
+        t_feat = time.perf_counter()
+
+        X = x[self.bundle.features].to_frame().T               # each bundle casts to its training dtype
+        p = float(self.bundle.predict_proba(X)[0])
+        uid = row.get("uid1")
+        if self.smooth and uid is not None:
+            p = self._smoothed(uid, p)
         t_model = time.perf_counter()
 
         rec = {"transaction_id": txn.get("TransactionID"), "event_time": txn.get("TransactionDT"),
@@ -216,13 +283,14 @@ class DecisionService:
         if action != "approve" or p >= self.policy.c.get("explain_min_p", 0.2):
             rec["reasons"] = self.bundle.reasons(X)[0]
         if self.challenger is not None:                        # Phase 8: shadow model, logged only
+            Xc = x[self.challenger.features].to_frame().T      # the challenger's OWN feature list
             rec["challenger"] = {"model_version": self.challenger.version,
-                                 "p_fraud": round(float(self.challenger.predict_proba(X)[0]), 6)}
+                                 "p_fraud": round(float(self.challenger.predict_proba(Xc)[0]), 6)}
         rec["latency_ms"] = {"features": round((t_feat - t0) * 1e3, 2), "model": round((t_model - t_feat) * 1e3, 2),
                              "rules_policy": round((t_rules - t_model) * 1e3, 2),
                              "total": round((time.perf_counter() - t0) * 1e3, 2)}
         self.log.write(rec)
         return rec
 
-    def record_label(self, txn_id, is_fraud: float) -> None:
-        self.engine.record_label(txn_id, is_fraud)
+    def record_label(self, txn_id, is_fraud: float, known_at: Optional[int] = None) -> str:
+        return self.engine.record_label(txn_id, is_fraud, known_at)
