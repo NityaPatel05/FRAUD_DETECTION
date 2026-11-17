@@ -113,21 +113,26 @@ def add_combo_keys(df: pd.DataFrame) -> pd.DataFrame:
     return df
 
 
-def label_encode_strings(df: pd.DataFrame, exclude: List[str]) -> Tuple[pd.DataFrame, Dict[str, List[str]]]:
+def label_encode_strings(df: pd.DataFrame, exclude: List[str],
+                         fit_mask: np.ndarray | None = None) -> Tuple[pd.DataFrame, Dict[str, List[str]]]:
     """Integer-encode every remaining string column (NaN stays NaN).
 
-    The value→code map is label-free; codes are arbitrary ids, so building them
-    on all rows leaks nothing. Unseen values at inference time map to NaN.
-    Returns the encoded frame and {col: categories} for inference.
+    The category list is fitted on the ``fit_mask`` rows only (the train window), exactly
+    what the online engine has: a value first seen later maps to NaN (missing), never to
+    a code. Returns the encoded frame and {col: categories} for inference.
     """
     maps: Dict[str, List[str]] = {}
     str_cols = [c for c in df.columns
                 if c not in exclude and (df[c].dtype == object or str(df[c].dtype) == "string")]
+    mask = np.ones(len(df), dtype=bool) if fit_mask is None else np.asarray(fit_mask, dtype=bool)
     for c in str_cols:
-        codes, cats = pd.factorize(df[c].astype("string"), sort=True, use_na_sentinel=True)
+        s = df[c].astype("string")
+        _, cats = pd.factorize(s[mask], sort=True, use_na_sentinel=True)
+        codes = pd.Categorical(s, categories=cats).codes            # -1 = missing or unseen
         df[c] = np.where(codes < 0, np.nan, codes).astype(np.float32)
         maps[c] = list(cats)
-    logger.info("Label-encoded {} string columns (e.g. {}).", len(str_cols), str_cols[:8])
+    logger.info("Label-encoded {} string columns (categories fitted on {} rows; e.g. {}).",
+                len(str_cols), int(mask.sum()), str_cols[:8])
     return df, maps
 
 

@@ -39,7 +39,8 @@ def main(args):
     cfg = yaml.safe_load(open("configs/config.yaml", encoding="utf-8"))
     ncfg = cfg["novelty"]
     out = Path(ncfg["out_dir"]); out.mkdir(parents=True, exist_ok=True)
-    delay = cfg["fe_v2"]["label_delay_days"] * 86400
+    from src.labels.policy import LabelPolicy, known_label
+    policy = LabelPolicy.from_cfg(cfg.get("label_policy"))          # the one label policy
 
     # ── raw, human-readable columns for segments and rules ───────────────────
     cols = ["TransactionID", "TransactionDT", "TransactionAmt", "isFraud"] + ncfg["segment_cols"] + ncfg["rule_cols"]
@@ -66,7 +67,10 @@ def main(args):
         base = df[(df["TransactionDT"] >= a.start_time - 7 * 86400) & (df["TransactionDT"] < a.start_time)]
         cand = mine_contrast_rules(seg_rows, base, ncfg["rule_cols"], ncfg["min_support"],
                                    ncfg["min_lift"], ncfg["max_rules_per_alert"], y_col="isFraud")
-        matured = df[df["TransactionDT"] < a.start_time - delay]          # labels known at alert time
+        kl = known_label(df["isFraud"].to_numpy(), df["TransactionID"].to_numpy(),
+                         df["TransactionDT"].to_numpy(), a.start_time, policy)     # labels known at alert time
+        matured = df.assign(isFraud=kl).dropna(subset=["isFraud"])
+        matured = matured[matured["TransactionDT"] < a.start_time]
         after = df[(df["TransactionDT"] >= a.start_time) & (df["TransactionDT"] < a.start_time + ncfg["rule_ttl_days"] * 86400)]
         for j, c in cand.iterrows():
             rule = {"id": f"alert{k}_rule{j}", "conditions": rule_to_conditions(c.rule),

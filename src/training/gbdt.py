@@ -24,6 +24,8 @@ def _cat_frame(X: pd.DataFrame, cat_cols: List[str]) -> pd.DataFrame:
 def apply_device(name: str, params: Dict, device: str) -> Dict:
     """Translate device='gpu' into each library's own GPU settings."""
     params = dict(params)
+    gpu_max_bin = params.pop("gpu_max_bin", 255)           # our own key, not a LightGBM parameter
+    gpu_eval_metric = params.pop("gpu_eval_metric", "Logloss")
     if device != "gpu":
         if name == "lgbm":                     # OpenCL ids mean nothing on CPU
             params.pop("gpu_platform_id", None); params.pop("gpu_device_id", None)
@@ -33,13 +35,17 @@ def apply_device(name: str, params: Dict, device: str) -> Dict:
     elif name == "catboost":
         params["task_type"] = "GPU"; params.setdefault("devices", "0")
         params.pop("thread_count", None)
-        # PRAUC / AUC are not implemented on GPU: CatBoost silently computes them on CPU
-        # every iteration (slow, and a CPU-fallback warning). Logloss is GPU-native.
+        # PRAUC is not available as a GPU eval metric: CatBoost computes it on CPU every
+        # iteration (slow + CPU-fallback warning), so early stopping would be CPU-bound.
+        # Default = Logloss (GPU-native; a proper scoring rule, correlates with AP but is not
+        # AP: rounds may differ slightly from PRAUC). Override with training_v2.catboost.gpu_eval_metric.
         if params.get("eval_metric") in ("PRAUC", "AUC"):
-            params["eval_metric"] = "Logloss"
+            params["eval_metric"] = gpu_eval_metric
     elif name == "lgbm":
         params["device_type"] = "gpu"          # OpenCL build; fit_model tries cuda, then CPU
-        params.setdefault("max_bin", 63)       # LightGBM's recommended setting for GPU speed
+        # max_bin 63 (LightGBM's GPU speed tip) quantises features too coarsely for ~400 tabular
+        # columns and cost accuracy; default 255 (training_v2.lgbm.gpu_max_bin). Explicit max_bin wins.
+        params.setdefault("max_bin", int(gpu_max_bin))
         # OpenCL may list an integrated GPU first: pin the NVIDIA one via config
         # (training_v2.lgbm.gpu_platform_id / gpu_device_id; see docs/GPU_SETUP.md)
     return params

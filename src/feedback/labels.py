@@ -5,6 +5,11 @@ Labels arrive late and from several sources (chargeback weeks later, analyst dec
 hours, customer report). A transaction is a usable NEGATIVE only once its chargeback
 window has closed; before that it is unlabelled, not legit. Training on immature
 "negatives" teaches the model that recent fraud is legit.
+
+This store holds labels that REALLY arrived (live system); the offline simulation of the
+same rules for historical data is src/labels/policy.py (``known_label``): same semantics
+(1 known fraud / 0 mature w/o fraud / NaN pending) and the same ``maturity_days``
+(configs/config.yaml: label_policy.maturity_days).
 """
 from __future__ import annotations
 
@@ -38,16 +43,19 @@ class LabelStore:
         return (q.sort_values(["transaction_id", "is_fraud"]).groupby("transaction_id").tail(1)
                  .reset_index(drop=True))
 
-    def training_labels(self, txns: pd.DataFrame, as_of: int, maturity_days: int,
+    def training_labels(self, txns: pd.DataFrame, as_of: int, maturity_days: int | None = None,
                         id_col: str = "TransactionID", time_col: str = "TransactionDT") -> pd.Series:
         """Label usable for training at time ``as_of``:
             1    fraud label already known
             0    no fraud known AND the transaction is older than the maturity window
             NaN  still immature (or in the future) → exclude from training
         """
+        if maturity_days is None:                      # default = the one label policy
+            from src.labels.policy import DEFAULT_POLICY
+            maturity_days = DEFAULT_POLICY.maturity_days
         known = self.known_as_of(as_of).set_index("transaction_id")["is_fraud"]
         y = txns[id_col].map(known)
-        mature = (txns[time_col] <= as_of - maturity_days * 86400).to_numpy()
+        mature = (txns[time_col] <= as_of - float(maturity_days) * 86400).to_numpy()
         y = pd.Series(np.where(y == 1, 1.0, np.where(mature, 0.0, np.nan)), index=txns.index)
         y[(txns[time_col] > as_of).to_numpy()] = np.nan
         return y

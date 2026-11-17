@@ -257,6 +257,40 @@ def delayed_label_stats(
     }
 
 
+def _count_ready(s: _Sorted, ready_orig: np.ndarray) -> np.ndarray:
+    """For every sorted row i: # rows j of the same entity with ready_j <= t_i.
+
+    ``ready_orig`` is aligned to the caller's row order. ready_j > t_j always (labels are
+    never instantaneous), so a counted row is strictly earlier than row i: no own label,
+    no future rows.
+    """
+    ready = np.asarray(ready_orig, dtype=np.float64)[s.order]
+    ok = np.isfinite(ready) & (s.c >= 0)
+    if ok.any() and ready[ok].max() >= _KEY_STRIDE - 1:
+        raise OverflowError("label ready time exceeds the sort-key stride")
+    ev = np.sort(s.c[ok] * _KEY_STRIDE + ready[ok].astype(np.int64))
+    hi = np.searchsorted(ev, s.key, side="right")
+    lo = np.searchsorted(ev, s.c * _KEY_STRIDE, side="left")
+    return np.maximum(hi - lo, 0).astype(np.float64)
+
+
+def policy_label_stats(codes: np.ndarray, t: np.ndarray, events,
+                       s: Optional[_Sorted] = None) -> Dict[str, np.ndarray]:
+    """Label counters of the entity's earlier rows under a ``LabelPolicy``.
+
+    ``events`` = ``src.labels.policy.LabelEvents`` (per-row times at which the row counts):
+      n             rows of the entity that are mature (labelled; mostly legit)
+      fraud         rows that are known fraud (any age)
+      fraud_mature  known-fraud rows that are also mature   (numerator of the smoothed rate)
+    """
+    s = s or _Sorted(codes, t)
+    return {
+        "n": s.to_orig(_count_ready(s, events.mature_time)),
+        "fraud": s.to_orig(_count_ready(s, events.fraud_time)),
+        "fraud_mature": s.to_orig(_count_ready(s, events.fraud_mature_time)),
+    }
+
+
 def smoothed_rate(fraud: np.ndarray, n: np.ndarray, prior: float, strength: float) -> np.ndarray:
     """Bayesian-smoothed fraud rate: (fraud + strength*prior) / (n + strength)."""
     return (fraud + strength * prior) / (n + strength)

@@ -25,7 +25,9 @@ from sklearn.metrics import average_precision_score
 
 from src.experiments.sequence_embedding import build_sequences, time_sliced_oof, train_score
 from src.feature_engineering.pipeline_v2 import dataset_tag
-from src.training.evaluation import time_folds
+from src.labels.policy import LabelPolicy
+from src.training.evaluation import make_folds
+from src.utils.run_guard import finish
 from src.training.gbdt import fit_model, predict
 
 
@@ -51,13 +53,16 @@ def main(args):
         out / "seq_gru_score.parquet", index=False)
 
     tr = tr.assign(seq_gru_score=seq_tr)
-    folds = time_folds(tr["day"].to_numpy(), tcfg["n_folds"], tcfg["fold_val_days"], tcfg["gap_days"])
+    policy = LabelPolicy.from_cfg(meta.get("label_policy") or cfg.get("label_policy"))
+    folds = make_folds(tr["TransactionDT"].to_numpy(), y, tr["TransactionID"].to_numpy(), tcfg["n_folds"],
+                       tcfg["fold_val_days"], policy, es_frac=tcfg.get("es_frac", 0.5))
     params = dict(tcfg["lgbm"]); params["learning_rate"] = args.lr
     res = {"base": [], "with_seq": []}
-    for tri, vai in folds:
+    for fo in folds:
         for name, cols in [("base", feats), ("with_seq", feats + ["seq_gru_score"])]:
-            m, _ = fit_model("lgbm", params, tr.iloc[tri][cols], y[tri], tr.iloc[vai][cols], y[vai], 100, device=args.device)
-            res[name].append(average_precision_score(y[vai], predict("lgbm", m, tr.iloc[vai][cols])))
+            m, _ = fit_model("lgbm", params, tr.iloc[fo.train][cols], fo.y_train, tr.iloc[fo.es][cols], y[fo.es], 100,
+                             device=args.device)                       # ES rows are not scored
+            res[name].append(average_precision_score(y[fo.score], predict("lgbm", m, tr.iloc[fo.score][cols])))
     gain = np.array(res["with_seq"]) - np.array(res["base"])
     keep = gain.mean() >= 0.005 and (gain > 0).sum() >= 2
     line = (f"\n## {dt.datetime.now():%Y-%m-%d %H:%M} — Phase 9 GRU sequence score ({tag})\n\n"
@@ -80,3 +85,4 @@ if __name__ == "__main__":
     ap.add_argument("--k", type=int, default=8)
     ap.add_argument("--lr", type=float, default=0.05)
     main(ap.parse_args())
+    finish()

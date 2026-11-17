@@ -4,8 +4,11 @@ Phase 7 — decision-policy simulation on the val holdout (no training).
   python scripts/run_policy_simulation.py [--schema raw]
 
 Uses artifacts/v2/<tag>/val_predictions.parquet (written by run_training.py):
-  1. sets review_min_p so the review queue fits review_capacity_per_day
-  2. applies the cost-based policy to every val transaction
+  The val window is split IN TIME: review_min_p is tuned on the first part (--tune-frac,
+  default half of the days) and ALL reported numbers come from the second part, which the
+  threshold never saw (tuning and reporting on the same rows overstated the savings).
+  1. sets review_min_p so the review queue fits review_capacity_per_day (tune part)
+  2. applies the cost-based policy to every transaction of the report part
   3. reports money: realised cost vs "approve everything" and vs a plain score threshold,
      fraud $ stopped, decline / step-up / review rates, precision of declines
 Writes policy_report.json and policy_overrides.json (read by the decision service).
@@ -24,6 +27,7 @@ import yaml
 
 from src.feature_engineering.pipeline_v2 import dataset_tag
 from src.serving.decision import CostPolicy
+from src.utils.run_guard import finish
 
 
 def realised_cost(action: np.ndarray, y: np.ndarray, amt: np.ndarray, c: dict) -> np.ndarray:
@@ -58,19 +62,30 @@ def main(args):
     p = vp["p_blend"].to_numpy(); y = vp["isFraud"].to_numpy().astype(int)
     amt = vp["TransactionAmt"].to_numpy(dtype=float)
     days = vp["TransactionDT"].to_numpy() // 86400
-    n_days = len(np.unique(days))
 
-    # 1. review threshold from capacity
+    # time split of the val window: tune on the first part, report on the second
+    ud = np.sort(np.unique(days))
+    cut_day = ud[max(1, int(round(len(ud) * args.tune_frac))) - 1]
+    tune = days <= cut_day
+    report_part = ~tune
+    if not report_part.any():
+        raise SystemExit("val window too short to split in time")
+
+    # 1. review threshold from capacity, tuned on the tune part only
     dcfg["review_min_p"] = 0.0
-    act = apply_policy(p, amt, dcfg)
-    per_day = pd.Series(act == "review").groupby(days).sum()
+    act_t = apply_policy(p[tune], amt[tune], dcfg)
+    d_t, p_t = days[tune], p[tune]
+    per_day = pd.Series(act_t == "review").groupby(d_t).sum()
     review_min_p = 0.0
     if per_day.max() > dcfg["review_capacity_per_day"]:
-        cand = np.sort(p[act == "review"])[::-1]
+        cand = np.sort(p_t[act_t == "review"])[::-1]
         for th in np.quantile(cand, np.linspace(0, 1, 201)):          # smallest threshold that fits
-            if pd.Series((act == "review") & (p >= th)).groupby(days).sum().max() <= dcfg["review_capacity_per_day"]:
+            if pd.Series((act_t == "review") & (p_t >= th)).groupby(d_t).sum().max() <= dcfg["review_capacity_per_day"]:
                 review_min_p = float(th); break
     dcfg["review_min_p"] = review_min_p
+    # everything below is computed on the held-out report part
+    p, y, amt, days = p[report_part], y[report_part], amt[report_part], days[report_part]
+    n_days = len(np.unique(days))
     act = apply_policy(p, amt, dcfg)
 
     # 2-3. money
@@ -85,6 +100,7 @@ def main(args):
     stopped = np.isin(act, ["decline", "review", "step_up"]) & (y == 1)
     rep = {
         "n_transactions": int(len(y)), "days": int(n_days), "review_min_p": review_min_p,
+        "review_min_p_tuned_on_days": [int(ud[0]), int(cut_day)], "reported_on_days": [int(cut_day) + 1, int(ud[-1])],
         "action_rates": pd.Series(act).value_counts(normalize=True).round(4).to_dict(),
         "reviews_per_day_max": int(pd.Series(act == "review").groupby(days).sum().max()),
         "cost_policy": float(cost.sum()), "cost_approve_all": float(approve_all.sum()),
@@ -105,4 +121,6 @@ if __name__ == "__main__":
     ap = argparse.ArgumentParser()
     ap.add_argument("--agg-mode", choices=["causal", "transductive"], default=None)
     ap.add_argument("--schema", choices=["full", "raw"], default=None)
+    ap.add_argument("--tune-frac", type=float, default=0.5, help="share of val days used to tune review_min_p")
     main(ap.parse_args())
+    finish()

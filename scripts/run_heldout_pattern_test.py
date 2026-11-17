@@ -24,7 +24,9 @@ from loguru import logger
 from sklearn.metrics import average_precision_score, roc_curve
 
 from src.feature_engineering.pipeline_v2 import dataset_tag
-from src.training.evaluation import time_folds
+from src.labels.policy import LabelPolicy, training_target
+from src.training.evaluation import make_folds
+from src.utils.run_guard import finish
 from src.training.gbdt import fit_model, predict
 
 
@@ -50,10 +52,19 @@ def main(args):
     dev = args.device or tcfg.get("device", "cpu")
 
     # rounds: early-stop once on the last train fold (val never used for this)
-    folds = time_folds(train["day"].to_numpy(), tcfg["n_folds"], tcfg["fold_val_days"], tcfg["gap_days"])
-    tr, va = folds[-1]
-    y_tr = train["isFraud"].to_numpy().astype(int)
-    _, rounds = fit_model("lgbm", params, train.iloc[tr][feats], y_tr[tr], train.iloc[va][feats], y_tr[va], 100, device=dev)
+    # one label policy: targets as known at the cutoff, early stopping on its own rows
+    policy = LabelPolicy.from_cfg(meta.get("label_policy") or cfg.get("label_policy"))
+    y_true = train["isFraud"].to_numpy().astype(int)
+    folds = make_folds(train["TransactionDT"].to_numpy(), y_true, train["TransactionID"].to_numpy(),
+                       tcfg["n_folds"], tcfg["fold_val_days"], policy, es_frac=tcfg.get("es_frac", 0.5))
+    f = folds[-1]
+    _, rounds = fit_model("lgbm", params, train.iloc[f.train][feats], f.y_train, train.iloc[f.es][feats], y_true[f.es],
+                          100, device=dev)
+    cutoff = int(val["TransactionDT"].min())
+    tgt, usable = training_target(y_true, train["TransactionID"].to_numpy(), train["TransactionDT"].to_numpy(),
+                                  cutoff, policy)
+    train = train[usable].reset_index(drop=True)
+    y_tr = tgt[usable].astype(int)
     y_val = val["isFraud"].to_numpy().astype(int)
 
     full_model, _ = fit_model("lgbm", params, train[feats], y_tr, n_rounds=rounds, device=dev)
@@ -91,3 +102,4 @@ if __name__ == "__main__":
     p.add_argument("--column", default="ProductCD")
     p.add_argument("--lr", type=float, default=0.05)
     main(p.parse_args())
+    finish()

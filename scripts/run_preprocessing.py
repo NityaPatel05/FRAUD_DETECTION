@@ -17,13 +17,24 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from pathlib import Path
 
+import numpy as np
 import yaml
 from loguru import logger
+
+from src.utils.run_guard import finish
 
 from src.preprocessing.sort_and_split import load_raw_data, sort_by_time, time_split
 
 
-def main():
+def sample_clients(df, frac: float):
+    """Dev/smoke subsample: keep a fixed share of CARDS (card1 hash), all their rows, so client
+    histories stay intact (a random row sample would destroy every velocity/history feature)."""
+    key = df["card1"].fillna(-1).astype("int64").to_numpy().astype("uint64")
+    h = ((key * np.uint64(2654435761)) % np.uint64(2 ** 32)).astype("float64") / 2 ** 32
+    return df[h < frac].reset_index(drop=True)
+
+
+def main(sample_frac: float = 1.0):
     with open("configs/config.yaml", encoding="utf-8") as f:
         cfg = yaml.safe_load(f)
 
@@ -32,6 +43,10 @@ def main():
 
     logger.info("=== Preprocessing ===")
     train_df, test_df = load_raw_data(cfg["paths"]["raw_dir"])   # renames test id-xx → id_xx
+    if sample_frac < 1.0:
+        train_df, test_df = sample_clients(train_df, sample_frac), sample_clients(test_df, sample_frac)
+        logger.warning("DEV SUBSAMPLE: {:.0%} of cards kept (train {} rows, test {} rows). Not for real results.",
+                       sample_frac, len(train_df), len(test_df))
     train_df = sort_by_time(train_df)
     test_df = sort_by_time(test_df)
 
@@ -45,4 +60,9 @@ def main():
 
 
 if __name__ == "__main__":
-    main()
+    import argparse
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--sample-frac", type=float, default=1.0,
+                    help="DEV ONLY: keep this share of cards (all their rows); 1.0 = everything")
+    main(ap.parse_args().sample_frac)
+    finish()

@@ -49,15 +49,15 @@ def add_graph_features(df: pd.DataFrame, t: np.ndarray, mode: str) -> Dict[str, 
 # connected components. All causal; labels only after the delay.
 # ═════════════════════════════════════════════════════════════════════════════
 
-def add_network_v4(df: pd.DataFrame, t: np.ndarray, y: np.ndarray, delay_days: int,
-                   smoothing: float, prior_rate: float, hub_cap: int = 20) -> Dict[str, np.ndarray]:
+def add_network_v4(df: pd.DataFrame, t: np.ndarray, events, smoothing: float, prior_rate: float,
+                   hub_cap: int = 20) -> Dict[str, np.ndarray]:
+    """``events``: LabelEvents from the shared label policy (src.labels.policy.label_ready_times)."""
     from src.feature_engineering.entity_ops import (
-        window_count_sum, first_time_pair, delayed_label_stats, smoothed_rate,
+        window_count_sum, first_time_pair, policy_label_stats, smoothed_rate,
     )
-    from src.feature_engineering.streaming_ops import window_distinct, identity_clusters
+    from src.feature_engineering.streaming_ops import window_distinct, identity_clusters_policy
 
     out: Dict[str, np.ndarray] = {}
-    delay = int(delay_days * 86400)
     uid = make_codes(df, "uid1")
 
     for ent in [c for c in ["device_fp", "card1_addr1"] if c in df.columns]:
@@ -81,22 +81,23 @@ def add_network_v4(df: pd.DataFrame, t: np.ndarray, y: np.ndarray, delay_days: i
         out[f"{ent}_new_links_1d"] = window_count_sum(ec, t, 86400, values=newflag, s=se)["sum"].astype(np.float32)
 
         # 4b. fraud exposure through the shared entity, EXCLUDING the client's own history
-        ent_lbl = delayed_label_stats(ec, t, y, delay)
-        own_lbl = delayed_label_stats(pair, t, y, delay)
+        ent_lbl = policy_label_stats(ec, t, events)
+        own_lbl = policy_label_stats(pair, t, events)
         other_n = ent_lbl["n"] - np.nan_to_num(own_lbl["n"], nan=0.0)
         other_f = ent_lbl["fraud"] - np.nan_to_num(own_lbl["fraud"], nan=0.0)
+        other_fm = ent_lbl["fraud_mature"] - np.nan_to_num(own_lbl["fraud_mature"], nan=0.0)
         out[f"{ent}_other_clients_lbl_fraud"] = other_f.astype(np.float32)
-        out[f"{ent}_other_clients_lbl_rate"] = smoothed_rate(other_f, other_n, prior_rate, smoothing).astype(np.float32)
+        out[f"{ent}_other_clients_lbl_rate"] = smoothed_rate(other_fm, other_n, prior_rate, smoothing).astype(np.float32)
 
     # 4c. incremental identity clusters: clients linked through shared devices (hub-capped)
     if "device_fp" in df.columns:
         dev = make_codes(df, "device_fp")
         newp = first_time_pair(dev, t, uid)
         newp = np.where(np.isnan(newp), np.where(dev >= 0, 1.0, 0.0), newp)   # first row of a device is a new pair
-        cl = identity_clusters(t, uid, dev, newp, y, delay, hub_cap)
+        cl = identity_clusters_policy(t, uid, dev, newp, events, hub_cap)
         out["cluster_n_clients"] = cl["size"].astype(np.float32)
         out["cluster_lbl_fraud"] = cl["fraud"].astype(np.float32)
-        out["cluster_lbl_rate"] = smoothed_rate(cl["fraud"], cl["labelled"], prior_rate, smoothing).astype(np.float32)
+        out["cluster_lbl_rate"] = smoothed_rate(cl["fraud_mature"], cl["labelled"], prior_rate, smoothing).astype(np.float32)
         out["cluster_merges_identities"] = cl["merge"].astype(np.float32)
 
     # 4d. ring signal: other clients sharing BOTH the device and the card+address

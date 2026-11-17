@@ -4,8 +4,9 @@ Phase 5 — Optuna hyper-parameter tuning on the walk-forward time folds.
   python scripts/run_tuning.py --model lgbm --trials 40 [--device gpu] [--schema raw]
   python scripts/run_training.py --use-tuned        # then train with the result
 
-Objective = mean AUC-PR over the time folds inside the train period. The val holdout
-is never seen. Trials are pruned after each fold if they fall below the median.
+Objective = mean AUC-PR over the rolling time folds inside the train period (targets as
+known at each fold cutoff; the first half of each val window is used only for early
+stopping, the second half only for the score). The val holdout is never seen. Trials are pruned after each fold if they fall below the median.
 Structural params are tuned at a fixed, faster learning rate; the final training
 keeps the config learning rate and re-picks the number of rounds by early stopping.
 Writes artifacts/v2/<tag>/tuned_<model>.json.
@@ -26,7 +27,9 @@ from loguru import logger
 from sklearn.metrics import average_precision_score
 
 from src.feature_engineering.pipeline_v2 import dataset_tag
-from src.training.evaluation import time_folds
+from src.labels.policy import LabelPolicy
+from src.training.evaluation import make_folds
+from src.utils.run_guard import finish
 from src.training.gbdt import fit_model, predict
 
 
@@ -71,19 +74,22 @@ def main(args):
         dropped = set(json.loads(drop_file.read_text())["dropped"])
         feats = [c for c in feats if c not in dropped]
     cat_cols = [c for c in meta["catboost_cat_cols"] if c in feats]
-    train = pd.read_parquet(fdir / "train.parquet", columns=["day", "isFraud"] + feats)
+    train = pd.read_parquet(fdir / "train.parquet", columns=["TransactionID", "TransactionDT", "isFraud"] + feats)
     y = train["isFraud"].to_numpy().astype(int)
-    folds = time_folds(train["day"].to_numpy(), tcfg["n_folds"], tcfg["fold_val_days"], tcfg["gap_days"])
+    policy = LabelPolicy.from_cfg(meta.get("label_policy") or cfg.get("label_policy"))
+    folds = make_folds(train["TransactionDT"].to_numpy(), y, train["TransactionID"].to_numpy(), tcfg["n_folds"],
+                       tcfg["fold_val_days"], policy, es_frac=tcfg.get("es_frac", 0.5))
     device = args.device or tcfg.get("device", "cpu")
     base = dict(tcfg[args.model]); base["learning_rate"] = args.lr
 
     def objective(trial):
         params = {**base, **space(trial, args.model)}
         aps = []
-        for i, (tr, va) in enumerate(folds):
-            m, best = fit_model(args.model, params, train.iloc[tr][feats], y[tr], train.iloc[va][feats], y[va],
+        for i, f in enumerate(folds):
+            m, best = fit_model(args.model, params, train.iloc[f.train][feats], f.y_train,
+                                train.iloc[f.es][feats], y[f.es],                 # early stopping rows are NOT scored
                                 early_stopping_rounds=100, cat_cols=cat_cols, device=device)
-            aps.append(average_precision_score(y[va], predict(args.model, m, train.iloc[va][feats], cat_cols)))
+            aps.append(average_precision_score(y[f.score], predict(args.model, m, train.iloc[f.score][feats], cat_cols)))
             trial.report(float(np.mean(aps)), i)
             if trial.should_prune():
                 raise optuna.TrialPruned()
@@ -116,3 +122,4 @@ if __name__ == "__main__":
     p.add_argument("--schema", choices=["full", "raw"], default=None)
     p.add_argument("--device", choices=["cpu", "gpu"], default=None)
     main(p.parse_args())
+    finish()

@@ -59,6 +59,23 @@ MEMORY & CHECKPOINTS
 
 Required steps stop the run on failure. Optional steps (heldout, novelty, exploration,
 latency, sequence) are logged and the run continues. Nothing in configs/ is modified.
+
+ROBUSTNESS (lessons from the first GPU run: 11 GPU-hours lost to a shutdown crash)
+  * SUCCESS SENTINEL. Every project script is launched through src/utils/run_guard.py, which
+    writes a sentinel file after the script's main() returned, flushes all logs and ends the
+    process with os._exit(0) (no native-library teardown). A command whose sentinel exists
+    counts as done even if the exit code is non-zero (warning in the log), e.g. the
+    0xC0000005 access violation that Python 3.14 + CUDA/OpenCL libraries raise at exit.
+  * "OUT OF MEMORY" is only reported when the log really shows a memory error.
+  * LOCK FILE results/run_all.lock: a second run_all refuses to start while another live one
+    holds it (stale locks of dead processes are taken over). Use --force-lock to override.
+  * PYTHON VERSION: 3.11-3.13 only. The bootstrap picks such an interpreter (py launcher /
+    python3.13 ...) and refuses 3.14 unless --allow-unsupported-python is given.
+  * CatBoost is OFF by default (it got blend weight 0 and took 2.8 h of tuning in the first
+    run); --with-catboost adds it to tuning and training.
+  * Label policy: --label-median-days / --maturity-days / --train-gap-days re-run the whole
+    pipeline under another chargeback-delay assumption (30/60/90); --tag-suffix keeps the
+    outputs of different policies apart (e.g. --label-median-days 60 --tag-suffix _d60).
 """
 from __future__ import annotations
 
@@ -76,10 +93,17 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent
 os.chdir(ROOT)
+sys.path.insert(0, str(ROOT))
 PY = sys.executable
+from src.utils.run_guard import (                      # stdlib-only helpers (also usable before the venv exists)
+    SENTINEL_ENV, acquire_lock, choose_python, classify_outcome, py_supported, release_lock,
+)
 RESULTS = ROOT / "results"
 LOGS = RESULTS / "logs"
 STATE = RESULTS / "state.json"
+LOCK = RESULTS / "run_all.lock"
+PROTOCOL = "A1-label-policy-v1"          # bump when feature/training semantics change: invalidates old checkpoints
+SENTINELS = RESULTS / ".sentinels"
 OLD_BASELINE = {"val_auc_pr_notebook02_days131_182": 0.608, "val_auc_pr_fold_average_days96_130": 0.6145}
 
 
@@ -156,13 +180,70 @@ def _req_fingerprint() -> str:
     return h.hexdigest()[:16]
 
 
+def _py_version_of(exe: str):
+    try:
+        out = subprocess.run([exe, "-c", "import sys;print(sys.version_info[0], sys.version_info[1])"],
+                             capture_output=True, text=True, timeout=30).stdout.split()
+        return int(out[0]), int(out[1])
+    except (OSError, subprocess.TimeoutExpired, ValueError, IndexError):
+        return None
+
+
+def find_base_python():
+    """Interpreter used to create the venv: Python 3.11-3.13 (newest first).
+
+    3.14 + native GPU libs crashes at interpreter shutdown (0xC0000005), so it is never
+    picked automatically. Candidates: the running interpreter, the Windows `py` launcher,
+    python3.13 / python3.12 / python3.11 on PATH.
+    """
+    cands = [(sys.executable, tuple(sys.version_info[:2]))]
+    for minor in (13, 12, 11):
+        found = []
+        if os.name == "nt" and shutil.which("py"):
+            try:
+                out = subprocess.run(["py", f"-3.{minor}", "-c", "import sys;print(sys.executable)"],
+                                     capture_output=True, text=True, timeout=30)
+                if out.returncode == 0 and out.stdout.strip():
+                    found.append(out.stdout.strip().splitlines()[0])
+            except (OSError, subprocess.TimeoutExpired):
+                pass
+        exe = shutil.which(f"python3.{minor}")
+        if exe:
+            found.append(exe)
+        for f in found:
+            v = _py_version_of(f)
+            if v:
+                cands.append((f, v))
+    return choose_python(cands)
+
+
+def _unsupported_python_message(version) -> str:
+    return (f"Python {version[0]}.{version[1]} is not supported (use 3.11-3.13). On Python 3.14 the native GPU "
+            "libraries (LightGBM/XGBoost/CatBoost/torch) crash at interpreter shutdown with 0xC0000005 and "
+            "the first GPU run lost ~11 hours that way. Install Python 3.13 (https://www.python.org/downloads/) "
+            "and run again, or pass --allow-unsupported-python at your own risk.")
+
+
 def bootstrap_venv(argv) -> None:
     """Create ./venv if needed, install CUDA torch + requirements-gpu.txt, then re-exec in the venv."""
-    if sys.version_info < (3, 11):
+    allow = "--allow-unsupported-python" in argv
+    base = find_base_python()
+    if base is None:
+        msg = _unsupported_python_message(sys.version_info[:2])
+        if not allow:
+            sys.exit("[bootstrap] " + msg)
+        _boot_say("WARNING: " + msg)
+        base = (sys.executable, tuple(sys.version_info[:2]))
+    if sys.version_info < (3, 11) and not allow:
         sys.exit(f"Python {sys.version.split()[0]} is too old: install Python 3.11-3.13 and run again.")
+    if VENV_PY.exists():
+        vv = _py_version_of(str(VENV_PY))
+        if vv and not py_supported(vv) and not allow:
+            sys.exit(f"[bootstrap] the existing venv/ uses Python {vv[0]}.{vv[1]}. " + _unsupported_python_message(vv)
+                     + " Delete the venv/ folder so it is re-created with a supported interpreter.")
     if not VENV_PY.exists():
-        _boot_say(f"creating virtual environment in {VENV} ...")
-        subprocess.run([sys.executable, "-m", "venv", str(VENV)], check=True)
+        _boot_say(f"creating virtual environment in {VENV} with {base[0]} (Python {base[1][0]}.{base[1][1]}) ...")
+        subprocess.run([base[0], "-m", "venv", str(VENV)], check=True)
     marker = VENV / ".run_all_installed"
     fp = _req_fingerprint()
     if not marker.exists() or marker.read_text().strip() != fp:
@@ -192,7 +273,6 @@ def bootstrap_venv(argv) -> None:
     sys.exit(subprocess.run([str(VENV_PY), str(Path(__file__).resolve()), *argv]).returncode)
 
 
-
 # ─────────────────────────────────────────────────────────────────────────────
 # small helpers
 # ─────────────────────────────────────────────────────────────────────────────
@@ -212,20 +292,54 @@ def save_state(state: dict) -> None:
     STATE.write_text(json.dumps(state, indent=1))
 
 
-def run_cmd(step: str, cmd: list, log_name: str | None = None) -> int:
-    """Run a command, streaming output to the console and to results/logs/<step>.log."""
+def run_cmd(step: str, cmd: list, log_name: str | None = None, guard: bool = False,
+            env_extra: dict | None = None) -> int:
+    """Run a command, streaming output to the console and to results/logs/<step>.log.
+
+    guard=True launches a project script through src/utils/run_guard.py (success sentinel +
+    hard exit, see the module docstring). Returns the exit code; ``LAST_RUN`` records the
+    sentinel and the log text of this command for ``classify_outcome``.
+    """
     log = LOGS / f"{log_name or step}.log"
-    say(f"  $ {' '.join(str(c) for c in cmd)}   (log: {log.relative_to(ROOT)})")
-    env = {**os.environ, "PYTHONIOENCODING": "utf-8", "PYTHONUNBUFFERED": "1"}
+    cmd = [str(c) for c in cmd]
+    sentinel = None
+    if guard and len(cmd) > 1 and cmd[1].endswith(".py"):
+        SENTINELS.mkdir(parents=True, exist_ok=True)
+        sentinel = SENTINELS / f"{step}_{abs(hash(' '.join(cmd))) % 10**8}_{int(time.time())}.ok"
+        cmd = [cmd[0], "-m", "src.utils.run_guard", *cmd[1:]]
+    say(f"  $ {' '.join(cmd)}   (log: {log.relative_to(ROOT)})")
+    env = {**os.environ, "PYTHONIOENCODING": "utf-8", "PYTHONUNBUFFERED": "1", **(env_extra or {})}
+    if sentinel:
+        env[SENTINEL_ENV] = str(sentinel)
+    else:
+        env.pop(SENTINEL_ENV, None)
+    start = log.stat().st_size if log.exists() else 0
     with open(log, "a", encoding="utf-8") as f:
-        f.write(f"\n===== {dt.datetime.now()} :: {' '.join(map(str, cmd))}\n")
-        proc = subprocess.Popen([str(c) for c in cmd], stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+        f.write(f"\n===== {dt.datetime.now()} :: {' '.join(cmd)}\n")
+        proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
                                 text=True, encoding="utf-8", errors="replace", env=env, cwd=ROOT)
         for line in proc.stdout:
             f.write(line)
             if not QUIET_CONSOLE:
                 sys.stdout.write("    " + line)
-        return proc.wait()
+        rc = proc.wait()
+    try:
+        with open(log, "rb") as f:
+            f.seek(start)
+            text = f.read().decode("utf-8", errors="replace")
+    except OSError:
+        text = ""
+    ok = bool(sentinel and sentinel.exists())
+    LAST_RUN.update({"sentinel": ok, "log": text})
+    if sentinel and sentinel.exists():
+        try:
+            sentinel.unlink()
+        except OSError:
+            pass
+    return rc
+
+
+LAST_RUN: dict = {"sentinel": False, "log": ""}
 
 
 def memory_status() -> str:
@@ -248,14 +362,13 @@ def memory_status() -> str:
 
 
 def looks_like_oom(rc: int, log: Path) -> bool:
-    if rc in (-9, 137, 3221225477, -1073741819, 3221226505):      # SIGKILL / Windows access-violation / stack
-        return True
+    """Kept for callers/tests: OOM only if the log shows a memory error (see run_guard)."""
+    from src.utils.run_guard import looks_like_oom as _l
     try:
-        tail = log.read_text(encoding="utf-8", errors="replace")[-6000:]
+        text = log.read_text(encoding="utf-8", errors="replace")
     except OSError:
-        return False
-    return any(k in tail for k in ("MemoryError", "Unable to allocate", "out of memory", "CUDA out of memory",
-                                   "std::bad_alloc", "Killed"))
+        text = ""
+    return _l(rc, text)
 
 
 def read_json(path) -> dict | None:
@@ -267,7 +380,7 @@ def read_json(path) -> dict | None:
 
 
 def art(tag: str) -> Path:
-    return ROOT / "artifacts" / "v2" / tag
+    return ROOT / "artifacts" / "v2" / (tag + os.environ.get("FRAUD_TAG_SUFFIX", ""))
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -369,8 +482,8 @@ def download_from_kaggle(raw: Path, args) -> None:
 def step_gpu_check(args) -> dict:
     if args.cpu:
         return {"device": "cpu", "smoke": "skipped (--cpu)"}
-    rc = run_cmd("gpu_check", [PY, "scripts/gpu_smoke_test.py", "--allow-lgbm-cpu", "--torch-optional"])
-    if rc == 0:
+    rc = run_cmd("gpu_check", [PY, "scripts/gpu_smoke_test.py", "--allow-lgbm-cpu", "--torch-optional"], guard=True)
+    if classify_outcome(rc, LAST_RUN["sentinel"], LAST_RUN["log"])[0] == "done":
         return {"device": "gpu", "smoke": "PASS"}
     if args.require_gpu:
         raise RuntimeError("GPU smoke test failed and --require-gpu was given — see results/logs/gpu_check.log "
@@ -387,22 +500,31 @@ def step_gpu_check(args) -> dict:
 def build_steps(args, device: str) -> list:
     dev = ["--device", device]
     quick = args.quick or args.low_memory
-    tuning_models = ["lgbm"] if quick else ["lgbm", "xgb", "catboost"]
+    # CatBoost got blend weight 0 and cost 2.8 h of tuning in the first GPU run: opt-in only
+    tuning_models = ["lgbm"] if quick else ["lgbm", "xgb"] + (["catboost"] if args.with_catboost else [])
+    mdl = ["--models", *(["lgbm", "xgb"] + (["catboost"] if args.with_catboost else []))]
+    pol = []                                   # label-policy overrides for the feature build
+    if args.label_median_days is not None:
+        pol += ["--label-median-days", str(args.label_median_days)]
+    if args.maturity_days is not None:
+        pol += ["--maturity-days", str(args.maturity_days)]
+    gap = ["--train-gap-days", str(args.train_gap_days)] if args.train_gap_days is not None else []
     trials = "15" if quick else str(args.trials)
     schemas = ["full", "raw"] if not args.full_only else ["full"]
     S = []   # (name, required, [commands])
     S.append(("preprocess", True, [[PY, "scripts/run_preprocessing.py"]]))
-    S.append(("features", True, [[PY, "scripts/run_feature_engineering.py", "--schema", s] for s in schemas]
-              + ([[PY, "scripts/run_feature_engineering.py", "--agg-mode", "transductive"]] if args.with_transductive else [])))
+    S.append(("features", True, [[PY, "scripts/run_feature_engineering.py", "--schema", s, *pol] for s in schemas]
+              + ([[PY, "scripts/run_feature_engineering.py", "--agg-mode", "transductive", *pol]] if args.with_transductive else [])))
     S.append(("selection", True, [[PY, "scripts/run_feature_selection.py", "--two-windows", "--schema", s] for s in schemas]))
     if not args.skip_ablation:
         abl_schemas = ["full"] if quick else schemas
-        S.append(("ablation", False, [[PY, "scripts/run_ablation.py", "--schema", s, *dev] for s in abl_schemas]))
+        abl = ["--seeds", "1" if quick else str(args.ablation_seeds)]
+        S.append(("ablation", False, [[PY, "scripts/run_ablation.py", "--schema", s, *dev, *abl] for s in abl_schemas]))
     S.append(("tuning", False, [[PY, "scripts/run_tuning.py", "--model", m, "--trials", trials, *dev] for m in tuning_models]))
     seeds = ["--n-seeds", "1"] if quick else []
-    S.append(("training", True, [[PY, "scripts/run_training.py", "--use-tuned", *seeds, *dev]]
-              + [[PY, "scripts/run_training.py", "--schema", s, *seeds, *dev] for s in schemas if s != "full"]
-              + ([[PY, "scripts/run_training.py", "--agg-mode", "transductive", *seeds, *dev]] if args.with_transductive else [])))
+    S.append(("training", True, [[PY, "scripts/run_training.py", "--use-tuned", *mdl, *gap, *seeds, *dev]]
+              + [[PY, "scripts/run_training.py", "--schema", s, *mdl, *gap, *seeds, *dev] for s in schemas if s != "full"]
+              + ([[PY, "scripts/run_training.py", "--agg-mode", "transductive", *mdl, *gap, *seeds, *dev]] if args.with_transductive else [])))
     S.append(("heldout", False, [[PY, "scripts/run_heldout_pattern_test.py", *dev]]))
     S.append(("novelty", False, [[PY, "scripts/run_novelty_monitoring.py"]]))
     S.append(("policy", False, [[PY, "scripts/run_policy_simulation.py", "--schema", s] for s in schemas]))
@@ -412,7 +534,8 @@ def build_steps(args, device: str) -> list:
                                       "--out", "results/latency.json"]]))
     if not args.skip_sequence:
         S.append(("sequence", False, [[PY, "scripts/run_sequence_experiment.py", "--epochs", "1" if quick else "3", *dev]]))
-    S.append(("final", False, [[PY, "scripts/run_training.py", "--final", "--use-tuned", *seeds, *dev]]))
+    # --final reuses the validation run's CV (rounds + OOF) when its fingerprint is identical
+    S.append(("final", False, [[PY, "scripts/run_training.py", "--final", "--use-tuned", *mdl, *gap, *seeds, *dev]]))
     if not args.skip_sim:
         sim_gen = [PY, "scripts/run_simulator.py", "--out", "data/synthetic/v1"]
         if quick:
@@ -432,15 +555,40 @@ def fmt(x, nd=4):
 
 
 def model_table(m: dict) -> list:
-    rows = ["| Model | CV AUC-PR (mean ± std) | Val AUC-PR | Val ROC-AUC | Recall @1% FPR | Precision top 1% |",
-            "|---|---|---|---|---|---|"]
+    rows = ["| Model | CV AUC-PR (mean +- SE) | Val AUC-PR | Val ROC-AUC | Recall @1% FPR | VDR @1% FPR | Precision top 1% |",
+            "|---|---|---|---|---|---|---|"]
     for name, r in (m.get("models") or {}).items():
         v = r.get("val", {})
-        rows.append(f"| {name} | {fmt(r.get('cv_ap_mean'))} ± {fmt(r.get('cv_ap_std'))} | {fmt(v.get('auc_pr'))} | "
-                    f"{fmt(v.get('auc_roc'))} | {fmt(v.get('recall_at_fpr_1pct'))} | {fmt(v.get('precision_top_1pct'))} |")
+        rows.append(f"| {name} | {fmt(r.get('cv_ap_mean'))} +- {fmt(r.get('cv_ap_se'))} | {fmt(v.get('auc_pr'))} | "
+                    f"{fmt(v.get('auc_roc'))} | {fmt(v.get('recall_at_fpr_1pct'))} | {fmt(v.get('vdr_at_fpr_1pct'))} | "
+                    f"{fmt(v.get('precision_top_1pct'))} |")
     b = m.get("blend_val") or {}
-    rows.append(f"| **calibrated blend** | — | **{fmt(b.get('auc_pr'))}** | {fmt(b.get('auc_roc'))} | "
-                f"{fmt(b.get('recall_at_fpr_1pct'))} | {fmt(b.get('precision_top_1pct'))} |")
+    rows.append(f"| **blend (ranking score)** | {fmt(m.get('blend_cv_ap_mean'))} +- {fmt(m.get('blend_cv_ap_se'))} | "
+                f"**{fmt(b.get('auc_pr'))}** | {fmt(b.get('auc_roc'))} | {fmt(b.get('recall_at_fpr_1pct'))} | "
+                f"{fmt(b.get('vdr_at_fpr_1pct'))} | {fmt(b.get('precision_top_1pct'))} |")
+    return rows
+
+
+def slice_table(m: dict) -> list:
+    sl = m.get("blend_val_slices") or {}
+    if not sl:
+        return []
+    rows = ["| Slice | Rows | Fraud rows | Base rate | AUC-PR | AP / base | Recall @1% FPR | VDR @1% FPR | CP@k daily |",
+            "|---|---|---|---|---|---|---|---|---|"]
+    names = {"all": "all validation rows", "client_seen": "client seen in training",
+             "cold_start": "COLD START (client never seen)", "uid_unbuildable": "client id unbuildable (addr1/D1 missing)",
+             "copied_removed": "COPIED POSITIVES REMOVED"}
+    for k, label in names.items():
+        r = sl.get(k)
+        if not r:
+            continue
+        if r.get("skipped"):
+            rows.append(f"| {label} | {r['n']} | {r['n_fraud']} | - | skipped ({r['skipped']}) | | | | |")
+            continue
+        cp = next((v for kk, v in r.items() if kk.startswith("cp_at_") and kk.endswith("_daily")), None)
+        rows.append(f"| {label} | {r['n']} | {r['n_fraud']} | {fmt(r.get('base_rate'))} | {fmt(r.get('auc_pr'))} | "
+                    f"{fmt(r.get('ap_over_base_rate'), 1)} | {fmt(r.get('recall_at_fpr_1pct'))} | "
+                    f"{fmt(r.get('vdr_at_fpr_1pct'))} | {fmt(cp)} |")
     return rows
 
 
@@ -450,21 +598,45 @@ def build_report(state: dict) -> None:
     L = ["# Fraud detection v2 — final results", "",
          f"Generated {dt.datetime.now():%Y-%m-%d %H:%M}. Device: **{state.get('env', {}).get('device', '?')}** "
          f"({state.get('env', {}).get('gpu', '?')}). Smoke test: {state.get('env', {}).get('smoke', '?')}.", ""]
+    if state.get("warnings"):
+        L += ["Runner warnings (step finished its work but the process crashed at shutdown; ignored):"] + \
+             [f"- {w}" for w in state["warnings"][-10:]] + [""]
 
     full = read_json(art("causal") / "metrics_val.json")
     raw = read_json(art("causal_raw") / "metrics_val.json")
     trans = read_json(art("transductive") / "metrics_val.json")
     res["metrics_full"], res["metrics_raw"], res["metrics_transductive"] = full, raw, trans
 
+    pol = next((m.get("label_policy") for m in (full, raw, trans) if m and m.get("label_policy")), None)
+    if pol:
+        res["label_policy"] = pol
+        L += ["## Label policy (identical for features, training targets and evaluation)", "",
+              f"- A fraud label becomes known `d` days after the transaction, `d` ~ lognormal(median {pol['delay_median_days']:g} d, "
+              f"sigma {pol['delay_sigma']:g}), capped at {pol['delay_cap_days']:g} d, deterministic per TransactionID.",
+              f"- A transaction without a known fraud label is treated as legit once it is {pol['maturity_days']:g} d old.",
+              f"- Training targets are the labels known at each cutoff; the last {pol['train_gap_days']:g} d before the cutoff are "
+              "excluded (train | gap | val). Validation/test are scored against the TRUE labels.",
+              "- Early stopping uses the first half of each validation window; only the second half is scored.",
+              "- Numbers are therefore lower than the first run (old protocol: labels known after exactly 30 d, early stopping "
+              "on the scored rows) -- that is the point.", ""]
+
     L += ["## Headline (validation holdout = days 131-182, never used for training or tuning)", "",
-          "| Model | Val AUC-PR | vs old 0.608 |", "|---|---|---|"]
+          "| Model | AUC-PR (all rows) | Base rate | AUC-PR cold-start clients | AUC-PR copied positives removed | Recall @1% FPR | VDR @1% FPR |",
+          "|---|---|---|---|---|---|---|"]
     for label, m in [("v2 full schema (all IEEE-CIS columns)", full), ("v2 raw schema (real-world fields only — served live)", raw),
                      ("v2 transductive (Kaggle-style, optimistic)", trans)]:
         if m and m.get("blend_val"):
-            ap = m["blend_val"]["auc_pr"]
-            L.append(f"| {label} | **{ap:.4f}** | {ap - 0.608:+.4f} |")
-    L += ["", "Old baseline: 0.608 (notebook 02, same val window, early-stopped on val so optimistic); "
-          "0.6145 (old scripted pipeline, days 96-130).", ""]
+            b, sl = m["blend_val"], m.get("blend_val_slices") or {}
+            L.append(f"| {label} | **{fmt(b.get('auc_pr'))}** | {fmt(b.get('base_rate'))} | "
+                     f"**{fmt((sl.get('cold_start') or {}).get('auc_pr'))}** | **{fmt((sl.get('copied_removed') or {}).get('auc_pr'))}** | "
+                     f"{fmt(b.get('recall_at_fpr_1pct'))} | {fmt(b.get('vdr_at_fpr_1pct'))} |")
+    L += ["", f"Old baselines (different, optimistic protocol: labels known after 30 d, early stopping on the scored rows): "
+          f"{OLD_BASELINE['val_auc_pr_notebook02_days131_182']} (notebook 02, same val window), "
+          f"{OLD_BASELINE['val_auc_pr_fold_average_days96_130']} (old scripted pipeline, days 96-130). "
+          "Not comparable with the numbers above.", "",
+          "Cold-start = clients never seen in training (what transfers to new customers in production). "
+          "Copied positives removed = fraud rows that come after the same client's first fraud are dropped "
+          "(IEEE propagated chargeback labels to later rows: remembering the client is not detection).", ""]
 
     for label, m in [("Full schema", full), ("Raw (real-world) schema", raw)]:
         if not m:
@@ -472,11 +644,33 @@ def build_report(state: dict) -> None:
         L += [f"## Models — {label}", ""] + model_table(m)
         cal = m.get("blend_val_calibration") or {}
         sm = m.get("blend_val_client_smoothed") or {}
-        L += ["", f"Blend weights (chosen on out-of-fold): `{m.get('blend_weights')}`  ",
-              f"Calibration: Brier {fmt(cal.get('brier'))}, ECE {fmt(cal.get('ece'))}  ",
+        b = m.get("blend_val") or {}
+        cp = next((v for kk, v in b.items() if kk.startswith("cp_at_") and kk.endswith("_daily")), None)
+        L += ["", f"Blend weights (chosen on out-of-fold scoring windows): `{m.get('blend_weights')}`  ",
+              "AUC-PR is computed on the uncalibrated blend score (ranking); the calibrated probability has the same order.  ",
+              f"Calibration (probabilities): Brier {fmt(cal.get('brier'))}, ECE {fmt(cal.get('ece'))}  ",
+              f"False-decline rate at the top-1% review budget: {fmt(b.get('false_decline_rate_top1pct'), 5)}; "
+              f"flag precision {fmt(b.get('flag_precision_top1pct'))}; card/client precision@k daily: {fmt(cp)}  ",
               f"Client-smoothed blend AUC-PR: {fmt(sm.get('auc_pr'))}  ",
-              f"Client precision @500: {fmt((m.get('blend_val') or {}).get('client_precision_at_500'))}  ",
               f"Features used: {m.get('n_features')}", ""]
+        folds = m.get("folds") or []
+        if folds:
+            ml = list((m.get("models") or {}))
+            L += ["Rolling folds (scored half of each validation window):", "",
+                  "| Fold | Days | Train rows (known fraud) | Scored rows | Base rate | " + " | ".join(f"{n} AP (AP/base)" for n in ml) + " |",
+                  "|---|---|---|---|---|" + "---|" * len(ml)]
+            for i, f in enumerate(folds):
+                cells = []
+                for n in ml:
+                    r = m["models"][n]
+                    cells.append(f"{fmt(r['cv_ap_folds'][i], 3)} ({fmt(r['cv_ap_over_base_folds'][i], 1)})"
+                                 if i < len(r.get("cv_ap_folds", [])) else "-")
+                L.append(f"| {f['fold']} | {f['val_days'][0]}-{f['val_days'][1]} | {f['n_train']} ({f['train_pos_known']}) | "
+                         f"{f['n_score']} | {f['score_base_rate']:.4f} | " + " | ".join(cells) + " |")
+            L.append("")
+        st = slice_table(m)
+        if st:
+            L += [f"Slices ({label}):", ""] + st + [""]
 
     # selection
     for tag in ["causal", "causal_raw"]:
@@ -494,9 +688,11 @@ def build_report(state: dict) -> None:
             ab = pd.read_csv(files[-1])
             res[f"ablation_{tag}"] = ab.to_dict("records")
             L += [f"## Feature-family ablation ({tag}) — remove one family, measure the loss", "",
-                  "| Family | # cols | CV AUC-PR without it | Gain from family | Folds helped | Verdict |", "|---|---|---|---|---|---|"]
+                  "Paired per-fold deltas averaged over several seeds; KEEP needs gain > 2 x SE and >= 0.005.", "",
+                  "| Family | # cols | CV AUC-PR without it | Gain from family (+- SE) | Folds helped | Verdict |", "|---|---|---|---|---|---|"]
             for _, r in ab.iterrows():
-                L.append(f"| {r['family']} | {r['n_removed']} | {r['ap_mean']:.4f} | {r['delta_if_removed']:+.4f} | "
+                se = f" +- {r['delta_se']:.4f}" if "delta_se" in ab.columns and r["delta_se"] == r["delta_se"] else ""
+                L.append(f"| {r['family']} | {r['n_removed']} | {r['ap_mean']:.4f} | {r['delta_if_removed']:+.4f}{se} | "
                          f"{r['folds_hurt_by_removal']} | {r['verdict']} |")
             L.append("")
 
@@ -601,8 +797,9 @@ def build_report(state: dict) -> None:
         L.append(f"| {name} | {s.get('status')} | {s.get('minutes', '—')} |")
     L += ["", "Logs: `results/logs/`. Full ablation history: `docs/ABLATIONS.md`. Plan: `docs/IMPROVEMENT_PLAN.md`."]
 
-    (RESULTS / "FINAL_REPORT.md").write_text("\n".join(L), encoding="utf-8")
-    (RESULTS / "results.json").write_text(json.dumps(res, indent=1, default=str), encoding="utf-8")
+    sfx = os.environ.get("FRAUD_TAG_SUFFIX", "")
+    (RESULTS / f"FINAL_REPORT{sfx}.md").write_text("\n".join(L), encoding="utf-8")
+    (RESULTS / f"results{sfx}.json").write_text(json.dumps(res, indent=1, default=str), encoding="utf-8")
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -613,7 +810,7 @@ QUIET_CONSOLE = False
 
 
 def main():
-    global QUIET_CONSOLE
+    global QUIET_CONSOLE, STATE
     for stream in (sys.stdout, sys.stderr):              # Windows consoles: never crash on ✓ / ✗
         try:
             stream.reconfigure(encoding="utf-8", errors="replace")
@@ -632,6 +829,14 @@ def main():
     ap.add_argument("--skip-torch-install", action="store_true")
     ap.add_argument("--trials", type=int, default=40, help="Optuna trials per model")
     ap.add_argument("--full-only", action="store_true", help="skip the raw (real-world) schema track")
+    ap.add_argument("--with-catboost", action="store_true", help="also tune/train CatBoost (off by default: blend weight 0, 2.8 h)")
+    ap.add_argument("--ablation-seeds", type=int, default=3, help="seeds per ablation arm (paired, averaged)")
+    ap.add_argument("--label-median-days", type=float, default=None, help="label policy: median chargeback delay (default config: 35)")
+    ap.add_argument("--maturity-days", type=float, default=None, help="label policy: days until an unreported txn counts as legit (default 90)")
+    ap.add_argument("--train-gap-days", type=float, default=None, help="label policy: rows this close to the cutoff are not trained on")
+    ap.add_argument("--tag-suffix", default="", help="suffix for feature/artifact folders, e.g. _d60, to keep policy variants apart")
+    ap.add_argument("--allow-unsupported-python", action="store_true", help="allow Python 3.14+ (native GPU libs may crash at exit)")
+    ap.add_argument("--force-lock", action="store_true", help="ignore results/run_all.lock (another run is active!)")
     ap.add_argument("--with-transductive", action="store_true", help="also run the Kaggle-style transductive variant")
     ap.add_argument("--skip-ablation", action="store_true")
     ap.add_argument("--skip-latency", action="store_true")
@@ -641,13 +846,34 @@ def main():
     ap.add_argument("--dry-run", action="store_true", help="check setup and print every command without running it")
     ap.add_argument("--no-venv", action="store_true", help="use the current Python instead of creating ./venv")
     args = ap.parse_args()
+    if args.tag_suffix:
+        os.environ["FRAUD_TAG_SUFFIX"] = args.tag_suffix          # inherited by every step (dataset_tag)
+        STATE = RESULTS / f"state{args.tag_suffix}.json"
     if not args.no_venv and not args.list and not _in_project_venv():
         bootstrap_venv(sys.argv[1:])            # never returns
+    if not args.list and not py_supported(tuple(sys.version_info[:2])):
+        msg = _unsupported_python_message(sys.version_info[:2])
+        if not args.allow_unsupported_python:
+            sys.exit("[run_all] " + msg)
+        print("[run_all] WARNING: " + msg, flush=True)
     QUIET_CONSOLE = args.quiet
 
     RESULTS.mkdir(exist_ok=True); LOGS.mkdir(exist_ok=True)
+    if not args.list and not args.dry_run and not args.force_lock:
+        ok, holder = acquire_lock(LOCK, {"cmd": " ".join(sys.argv)})
+        if not ok:
+            sys.exit(f"[run_all] another run_all is active (pid {holder.get('pid')}, started {holder.get('started')}): "
+                     f"{holder.get('cmd')}. Two runs would overwrite each other's models and state. "
+                     f"Wait for it, stop it, or pass --force-lock if you are sure it is dead.")
+        import atexit
+        atexit.register(release_lock, LOCK)
     resume = not args.fresh
     state = load_state() if resume else {"steps": {}}
+    if state.get("steps") and state.get("protocol") != PROTOCOL:
+        say(f"Checkpoint results/{STATE.name} was written by an older protocol ({state.get('protocol')!r}, before the "
+            f"label policy / rolling-fold fixes): its features and models are NOT comparable, so every step is re-run.")
+        state = {"steps": {}}
+    state["protocol"] = PROTOCOL
     if resume and state.get("steps"):
         say(f"Resuming from checkpoint results/state.json ({sum(1 for v in state['steps'].values() if v.get('status') == 'done')} steps done). Use --fresh to start over.")
 
@@ -701,12 +927,15 @@ def main():
             if resume and done_cmds.get(key) == "done":
                 say(f"    ✓ already done (checkpoint): {key}"); continue
             say(f"    memory before: {memory_status()}")
-            rc = run_cmd(name, cmd)                           # separate process → memory freed on exit
-            if rc != 0:
-                oom = looks_like_oom(rc, LOGS / f"{name}.log")
+            rc = run_cmd(name, cmd, guard=True)               # separate process → memory freed on exit
+            status, warn = classify_outcome(rc, LAST_RUN["sentinel"], LAST_RUN["log"])
+            if warn:
+                say(f"    WARNING: {warn}")
+                state.setdefault("warnings", []).append(f"{name}: {key}: {warn}")
+            if status != "done":
                 failed = (f"command {i + 1}/{len(cmds)} exited {rc}"
-                          + (" — looks like OUT OF MEMORY: re-run `python run_all.py` to resume, "
-                             "or add --low-memory" if oom else ""))
+                          + (" — the log shows an OUT OF MEMORY error: re-run `python run_all.py` to resume, "
+                             "or add --low-memory" if status == "oom" else ""))
                 done_cmds[key] = "failed"; save_state(state)
                 break
             done_cmds[key] = "done"; save_state(state)       # checkpoint immediately
@@ -729,7 +958,7 @@ def main():
     build_report(state)
     total = round((time.time() - t_start) / 60, 1)
     say(f"ALL DONE in {total} min → results/FINAL_REPORT.md")
-    print("\n" + (RESULTS / "FINAL_REPORT.md").read_text(encoding="utf-8")[:4000])
+    print("\n" + (RESULTS / f"FINAL_REPORT{os.environ.get('FRAUD_TAG_SUFFIX', '')}.md").read_text(encoding="utf-8")[:4000])
 
 
 if __name__ == "__main__":

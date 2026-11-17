@@ -148,11 +148,26 @@ database:
 #  v2 pipeline (tree models) — see scripts/run_feature_engineering.py,
 #  scripts/run_feature_selection.py, scripts/run_training.py
 # ══════════════════════════════════════════════════════════════════════════════
+# ══════════════════════════════════════════════════════════════════════════════
+#  ONE label policy (src/labels/policy.py) -- features, training targets, evaluation, serving
+#  Real labels are late: a fraud is known `d` days after the transaction (chargeback delay);
+#  a transaction with no known fraud label is only trusted as legit once it is `maturity_days`
+#  old. Re-run at other assumptions with run_all.py --label-median-days 60 --tag-suffix _d60.
+# ══════════════════════════════════════════════════════════════════════════════
+label_policy:
+  delay_median_days:  35        # median fraud-label (chargeback) delay; lognormal, per-TransactionID hash
+  delay_sigma:        0.6       # lognormal shape (~6% of frauds take longer than 90 d)
+  delay_min_days:     1
+  delay_cap_days:     120
+  maturity_days:      90        # unreported -> treated as legit after this (was feedback_v2.maturity_days)
+  train_gap_days:     7         # rows this close before the cutoff are dropped from training (train | gap | val)
+  seed:               20240601
+
 fe_v2:
   # causal       = client statistics use only past rows (servable online; honest score)
   # transductive = statistics over all rows incl. future (Kaggle 1st-place style; optimistic)
   agg_mode:             causal
-  label_delay_days:     30        # fraud labels only usable once older than this
+  # label timing: see the top-level `label_policy` section (one policy for features, training, eval, serving)
   label_smoothing:      20.0      # pseudo-count pulling entity fraud rates to the global rate
   velocity_windows_sec: [3600, 86400, 604800, 2592000]   # 1h, 1d, 7d, 30d
   count_window_days:    30        # causal count-encoding window
@@ -179,13 +194,17 @@ training_v2:
   device:         cpu
   # Time-ordered CV inside the train period: each fold validates on a later
   # window, separated from its training data by a gap (label-delay realism).
-  n_folds:        3
-  fold_val_days:  15
-  gap_days:       7
+  # Rolling (prequential) folds: train | gap | val, targets as known at each cutoff (label_policy).
+  # The first `es_frac` of each val window is used ONLY for early stopping, the rest ONLY for scoring.
+  n_folds:        5
+  fold_val_days:  10
+  es_frac:        0.5
+  gap_days:       7               # legacy readers (sim track, heldout, sequence); the trainer uses label_policy.train_gap_days
+  cp_k:           100             # card/client precision@k per day
   refit_max_round_scale: 1.5      # refit rounds = mean(best_iter) * min(n_refit_rows / n_fold_train_rows, this)
   n_seeds:        3               # seed-bagging for the refit models
   early_stopping_rounds: 200
-  models:         [lgbm, xgb, catboost]
+  models:         [lgbm, xgb]     # CatBoost got blend weight 0 and cost 2.8 h of tuning: opt in with --models ... catboost
   postprocess_uid_smoothing: true # also report AP after averaging scores per client
 
   lgbm:
@@ -207,6 +226,7 @@ training_v2:
     # auto; set after `scripts/gpu_smoke_test.py` shows which platform is NVIDIA.
     gpu_platform_id:   -1
     gpu_device_id:     -1
+    gpu_max_bin:       255        # 63 (LightGBM's GPU speed tip) lost accuracy on ~400 tabular columns
 
   xgb:                            # Deotte (IEEE-CIS 1st place) settings
     objective:         "binary:logistic"
@@ -228,6 +248,7 @@ training_v2:
     l2_leaf_reg:       5
     eval_metric:       PRAUC
     has_time:          true       # ordered target statistics follow time order
+    gpu_eval_metric:   Logloss    # PRAUC is CPU-only in CatBoost: on GPU early stopping uses this instead
     thread_count:      -1
     verbose:           500
 
@@ -281,7 +302,7 @@ decision_v2:
 #  Phase 8 — feedback loop & safe deployment (src/feedback/, src/jobs/retrain_v2.py)
 # ══════════════════════════════════════════════════════════════════════════════
 feedback_v2:
-  maturity_days:      90          # a txn becomes a usable NEGATIVE only after this (chargeback window)
+  # maturity_days moved to label_policy.maturity_days (single source of truth)
   registry:           "artifacts/v2/registry.json"
   monitoring_dir:     "artifacts/v2/monitoring"
   psi_reference_days: 7

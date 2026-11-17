@@ -19,11 +19,28 @@ Branch: `improve-aucpr`. The plan combines the code audit (4 agents) with resear
 | 9 synthetic simulator | 🔄 | — | other Claude session (`src/simulator/`, `docs/SYNTHETIC_DATA.md`) |
 | GPU training | ✅ | — | `--device gpu` / `training_v2.device` |
 
-57 tests pass (`tests/test_v2_pipeline.py`, `test_novelty.py`, `test_serving.py`, `test_feedback.py`, `test_experiments.py`), including:
+Tests (`tests/`, `pytest.ini` limits collection to `tests/`): `test_v2_pipeline.py`, `test_novelty.py`, `test_serving.py`, `test_feedback.py`, `test_experiments.py`, plus A1: `test_label_policy.py`, `test_training_eval.py`, `test_run_guard.py`. They include:
 - the no-future-leakage test for every feature;
 - an online/offline parity test over all features, with a negative control that proves the check can fail.
 
-Nothing has been trained or run on real data yet.
+### Phase A1 -- "fix the offline system" (2026-11-17, from `docs/REAL_SYSTEM_GAP_ANALYSIS.md`)
+
+The first GPU run proved the pipeline runs but not that the numbers mean anything. Fixed in code (not yet re-run on GPU):
+
+| Problem found | Fix |
+|---|---|
+| Runner marked steps FAILED after "Report saved" (0xC0000005 at shutdown on Python 3.14); ~11 GPU-hours lost | `src/utils/run_guard.py`: success sentinel + `os._exit`; runner trusts the sentinel, OOM only if the log shows it, lock file, Python 3.11-3.13 only. CatBoost off by default; `--final` reuses the validation run's CV |
+| Isotonic step output used for ranking (26% ties at p=0, blend AP < LightGBM) | `CalibratedRankBlender.score()` ranks, `predict_proba` = isotonic + strictly monotone tiebreak; smooth percentile extrapolation |
+| Every label assumed known exactly 30 d later; config said 30 d and 90 d | `src/labels/policy.py` + `label_policy` config: per-transaction chargeback delay (lognormal, median 35 d, cap 120), unreported = legit after 90 d. Used by features, training targets (known at cutoff, `train_gap_days`), evaluation. Online engine must adopt it (phase A2) |
+| Early stopping on the rows that were scored; 3 x 15-day folds | rolling 5 x 10-day folds, first half of each val window = early stopping only, second half = score |
+| Only AP / recall@FPR | value detection rate, CP@k per day, false-decline rate, per-fold base rate and AP/base; slices: cold-start clients, unbuildable uid, copied positives removed |
+| LightGBM GPU `max_bin=63`; CatBoost GPU stops on Logloss | `max_bin` 255 (`gpu_max_bin`); CatBoost metric configurable and documented |
+| Ablation noise (+-0.003) vs keep threshold 0.005 | `--seeds` (default 3), paired per-fold deltas, KEEP needs gain > 2 x SE and >= 0.005; `--groups` (preset `overlap`) |
+| Label encoder fitted on train+val+test; policy tuned and reported on the same val | encoder fitted on train rows (unseen -> NaN); `run_policy_simulation.py` tunes on the first half of val, reports the second |
+
+Expect LOWER numbers than the first run: that is the honest protocol, not a regression. Compare runs only under the same label policy (`--label-median-days 30/60/90`, `--tag-suffix`).
+
+Status: code done, unit-tested; the CPU smoke on a 20% card sample is the only end-to-end run so far. Not yet run on the full data.
 
 ### Full run order (on the GPU machine)
 ```
@@ -38,7 +55,7 @@ python scripts/run_ablation.py --device gpu                # (+ --schema raw)
 
 # Phase 5: tune, then train the calibrated ensemble
 python scripts/run_tuning.py --model lgbm --device gpu
-python scripts/run_training.py --use-tuned --device gpu    # writes bundle_refit.json, val_predictions.parquet
+python scripts/run_training.py --use-tuned --device gpu    # writes bundle_refit.json, val_predictions.parquet (LightGBM + XGBoost; add --models lgbm xgb catboost for CatBoost)
 python scripts/run_training.py --schema raw --device gpu   # the model the live system serves
 
 # Phase 6: novelty

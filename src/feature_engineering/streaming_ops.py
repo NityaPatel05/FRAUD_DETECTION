@@ -129,26 +129,38 @@ def _find(parent, x):
 
 
 @njit(cache=True)
-def _union_find_stream(t, client, link, link_new_pair, y, delay, hub_cap, n_client, n_link):
-    """Rows must be in time order. Nodes: clients [0, n_client), links after."""
+def _union_find_stream(t, client, link, link_new_pair, ev_t, ev_row, ev_kind, hub_cap, n_client, n_link):
+    """Rows must be in time order. Nodes: clients [0, n_client), links after.
+
+    Label events (sorted by ev_t): kind 0 = row becomes labelled/mature, 1 = row becomes a
+    known fraud, 2 = known fraud that is also mature. They enter the client's component
+    when ev_t <= the current row time.
+    """
     n = len(t)
+    ne = len(ev_t)
     parent = np.arange(n_client + n_link)
     size = np.zeros(n_client + n_link)          # number of CLIENT nodes in component
     size[:n_client] = 1.0
     fraud = np.zeros(n_client + n_link)
+    fraud_m = np.zeros(n_client + n_link)
     labelled = np.zeros(n_client + n_link)
     deg = np.zeros(n_link)                      # distinct clients per link entity
     out_size = np.full(n, np.nan)
     out_fraud = np.full(n, np.nan)
+    out_fraud_m = np.full(n, np.nan)
     out_lab = np.full(n, np.nan)
     out_merge = np.full(n, np.nan)
-    p = 0                                       # pointer: next label to mature
+    p = 0                                       # pointer: next label event to mature
     for i in range(n):
-        while p < n and t[p] + delay <= t[i]:   # labels that are known by now
-            if not np.isnan(y[p]) and client[p] >= 0:
-                r = _find(parent, client[p])
+        while p < ne and ev_t[p] <= t[i]:       # labels that are known by now
+            r = _find(parent, client[ev_row[p]])
+            k = ev_kind[p]
+            if k == 0:
                 labelled[r] += 1.0
-                fraud[r] += y[p]
+            elif k == 1:
+                fraud[r] += 1.0
+            else:
+                fraud_m[r] += 1.0
             p += 1
         c = client[i]
         if c < 0:
@@ -156,13 +168,13 @@ def _union_find_stream(t, client, link, link_new_pair, y, delay, hub_cap, n_clie
         rc = _find(parent, c)
         lk = link[i]
         merge = 0.0
-        size_now = size[rc]; fraud_now = fraud[rc]; lab_now = labelled[rc]
+        size_now = size[rc]; fraud_now = fraud[rc]; lab_now = labelled[rc]; fm_now = fraud_m[rc]
         can_link = lk >= 0 and deg[lk] + link_new_pair[i] <= hub_cap
         if can_link:
             rl = _find(parent, n_client + lk)
             if rl != rc and size[rl] > 0:
                 merge = 1.0                     # bridges two existing identities
-        out_size[i] = size_now; out_fraud[i] = fraud_now
+        out_size[i] = size_now; out_fraud[i] = fraud_now; out_fraud_m[i] = fm_now
         out_lab[i] = lab_now; out_merge[i] = merge
         if lk >= 0:
             deg[lk] += link_new_pair[i]
@@ -173,7 +185,25 @@ def _union_find_stream(t, client, link, link_new_pair, y, delay, hub_cap, n_clie
                     rl, rc = rc, rl
                 parent[rl] = rc
                 size[rc] += size[rl]; fraud[rc] += fraud[rl]; labelled[rc] += labelled[rl]
-    return out_size, out_fraud, out_lab, out_merge
+                fraud_m[rc] += fraud_m[rl]
+    return out_size, out_fraud, out_lab, out_merge, out_fraud_m
+
+
+def _run_clusters(t, client_codes, link_codes, link_new_pair, ev_time, ev_row, ev_kind, hub_cap):
+    t = np.asarray(t, dtype=np.int64)
+    if np.any(np.diff(t) < 0):
+        raise ValueError("identity_clusters: rows must be time-sorted")
+    client = np.asarray(client_codes, dtype=np.int64)
+    link = np.asarray(link_codes, dtype=np.int64)
+    n_client = int(client.max()) + 1 if client.max() >= 0 else 1
+    n_link = int(link.max()) + 1 if link.max() >= 0 else 1
+    newp = np.nan_to_num(np.asarray(link_new_pair, dtype=np.float64), nan=0.0)
+    order = np.argsort(ev_time, kind="mergesort")
+    size, fraud, lab, merge, fraud_m = _union_find_stream(
+        t, client, link, newp, np.asarray(ev_time, dtype=np.float64)[order],
+        np.asarray(ev_row, dtype=np.int64)[order], np.asarray(ev_kind, dtype=np.int64)[order],
+        float(hub_cap), n_client, n_link)
+    return {"size": size, "fraud": fraud, "labelled": lab, "merge": merge, "fraud_mature": fraud_m}
 
 
 def identity_clusters(t: np.ndarray, client_codes: np.ndarray, link_codes: np.ndarray,
@@ -183,21 +213,30 @@ def identity_clusters(t: np.ndarray, client_codes: np.ndarray, link_codes: np.nd
 
     A link entity used by more than ``hub_cap`` distinct clients stops linking
     (shared NAT / family / public devices would otherwise merge everyone).
-    Fraud labels enter the component only once they are ``delay_sec`` old.
-    Rows must already be sorted by time (the v2 frame is).
+    Fixed-delay labels (every label known ``delay_sec`` after its row); the policy
+    version is ``identity_clusters_policy``. Rows must be sorted by time.
     """
-    t = np.asarray(t, dtype=np.int64)
-    if np.any(np.diff(t) < 0):
-        raise ValueError("identity_clusters: rows must be time-sorted")
+    y = np.asarray(y, dtype=np.float64)
     client = np.asarray(client_codes, dtype=np.int64)
-    link = np.asarray(link_codes, dtype=np.int64)
-    n_client = int(client.max()) + 1 if client.max() >= 0 else 1
-    n_link = int(link.max()) + 1 if link.max() >= 0 else 1
-    newp = np.nan_to_num(np.asarray(link_new_pair, dtype=np.float64), nan=0.0)
-    size, fraud, lab, merge = _union_find_stream(
-        t, client, link, newp, np.asarray(y, dtype=np.float64),
-        np.int64(delay_sec), float(hub_cap), n_client, n_link)
-    return {"size": size, "fraud": fraud, "labelled": lab, "merge": merge}
+    rows = np.nonzero(~np.isnan(y) & (client >= 0))[0]
+    fr = rows[y[rows] == 1]
+    tt = np.asarray(t, dtype=np.int64)
+    ev_time = np.concatenate([tt[rows], tt[fr], tt[fr]]) + np.int64(delay_sec)
+    ev_row = np.concatenate([rows, fr, fr])
+    ev_kind = np.concatenate([np.zeros(len(rows)), np.ones(len(fr)), np.full(len(fr), 2)]).astype(np.int64)
+    return _run_clusters(t, client_codes, link_codes, link_new_pair, ev_time, ev_row, ev_kind, hub_cap)
+
+
+def identity_clusters_policy(t: np.ndarray, client_codes: np.ndarray, link_codes: np.ndarray,
+                             link_new_pair: np.ndarray, events, hub_cap: int = 20) -> Dict[str, np.ndarray]:
+    """``identity_clusters`` with per-row label times from ``LabelPolicy`` (label_ready_times)."""
+    client = np.asarray(client_codes, dtype=np.int64)
+    times, rows, kinds = [], [], []
+    for kind, arr in enumerate([events.mature_time, events.fraud_time, events.fraud_mature_time]):
+        idx = np.nonzero(np.isfinite(arr) & (client >= 0))[0]
+        times.append(np.asarray(arr)[idx]); rows.append(idx); kinds.append(np.full(len(idx), kind))
+    return _run_clusters(t, client_codes, link_codes, link_new_pair, np.concatenate(times),
+                         np.concatenate(rows), np.concatenate(kinds).astype(np.int64), hub_cap)
 
 
 def lag_values(codes: np.ndarray, t: np.ndarray, values: np.ndarray, k: int) -> np.ndarray:

@@ -26,6 +26,7 @@ import yaml
 from loguru import logger
 
 from src.feature_engineering.pipeline_v2 import run_feature_pipeline_v2, dataset_tag
+from src.utils.run_guard import finish
 
 
 def main(args):
@@ -36,6 +37,14 @@ def main(args):
         fe_cfg["agg_mode"] = args.agg_mode
     if args.schema:
         fe_cfg["schema"] = args.schema
+    # one label policy for features, training and evaluation (configs/config.yaml: label_policy)
+    pol = dict(cfg.get("label_policy", {}))
+    if args.label_median_days is not None:
+        pol["delay_median_days"] = args.label_median_days
+    if args.maturity_days is not None:
+        pol["maturity_days"] = args.maturity_days
+    fe_cfg["label_policy"] = pol
+    fe_cfg.pop("label_delay_days", None)           # legacy key, superseded by label_policy
     mode = fe_cfg.get("agg_mode", "causal")
     tag = dataset_tag(mode, fe_cfg.get("schema", "full"))
 
@@ -63,4 +72,9 @@ if __name__ == "__main__":
     p.add_argument("--agg-mode", choices=["causal", "transductive"], default=None)
     p.add_argument("--schema", choices=["full", "raw"], default=None,
                    help="raw = only real-world gateway fields (no Vesta V/C/D2-15/id_01-11)")
+    p.add_argument("--label-median-days", type=float, default=None,
+                   help="label policy: median chargeback delay in days (default: config label_policy)")
+    p.add_argument("--maturity-days", type=float, default=None,
+                   help="label policy: an unreported txn counts as legit after this many days")
     main(p.parse_args())
+    finish()

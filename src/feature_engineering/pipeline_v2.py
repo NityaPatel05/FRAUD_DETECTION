@@ -36,6 +36,7 @@ from src.feature_engineering.derived_signals import (
 from src.feature_engineering.entity_ops import make_codes
 from src.feature_engineering.graph_features import add_graph_features, add_network_v4
 from src.feature_engineering.label_history import add_label_history
+from src.labels.policy import LabelPolicy, label_ready_times, policy_summary
 from src.preprocessing.v_column_reduction import group_v_cols_by_nan, reduce_v_keep_most_unique
 
 # High-cardinality key strings: used for grouping/counting, never as raw features
@@ -53,7 +54,8 @@ CATBOOST_CAT_COLS = [
 
 DEFAULTS = {
     "agg_mode": "causal",
-    "label_delay_days": 30,
+    "label_delay_days": None,       # LEGACY: if set (and no label_policy given) -> fixed-delay policy
+    "label_policy": None,           # dict for src.labels.policy.LabelPolicy (config.yaml: label_policy)
     "label_smoothing": 20.0,
     "velocity_windows_sec": [3600, 86400, 604800, 2592000],
     "count_window_days": 30,
@@ -75,8 +77,23 @@ DEFAULTS = {
 
 
 def dataset_tag(mode: str, schema: str = "full") -> str:
-    """Folder suffix for a feature set: causal | transductive | causal_raw | …"""
-    return mode if schema == "full" else f"{mode}_{schema}"
+    """Folder suffix for a feature set: causal | transductive | causal_raw | …
+
+    Env var FRAUD_TAG_SUFFIX (e.g. "_d60") appends a variant suffix so runs under another
+    label policy never overwrite each other (run_all.py --tag-suffix sets it for all steps).
+    """
+    import os
+    base = mode if schema == "full" else f"{mode}_{schema}"
+    return base + os.environ.get("FRAUD_TAG_SUFFIX", "")
+
+
+def resolve_label_policy(cfg: Dict) -> LabelPolicy:
+    """label_policy dict > legacy fixed label_delay_days > default policy."""
+    if cfg.get("label_policy"):
+        return LabelPolicy.from_cfg(cfg["label_policy"])
+    if cfg.get("label_delay_days"):
+        return LabelPolicy.fixed(float(cfg["label_delay_days"]))
+    return LabelPolicy()
 
 
 def _downcast(df: pd.DataFrame) -> pd.DataFrame:
@@ -93,10 +110,15 @@ def run_feature_pipeline_v2(
     fe_cfg: Dict | None = None,
 ) -> Tuple[Dict[str, pd.DataFrame], Dict]:
     cfg = {**DEFAULTS, **(fe_cfg or {})}
+    policy = resolve_label_policy(cfg)
+    cfg["label_policy"] = policy.to_dict()          # recorded in meta: serving + training reuse it
+    # legacy field read by the pre-policy online engine (src/serving); the policy is the truth
+    cfg["label_delay_days"] = cfg.get("label_delay_days") or policy.delay_median_days
     mode = cfg["agg_mode"]
     if mode not in ("causal", "transductive"):
         raise ValueError(f"agg_mode must be causal|transductive, got {mode}")
     logger.info("=== v2 feature pipeline | agg_mode={} ===", mode)
+    logger.info("Label policy: {}", policy_summary(policy))
 
     # ── 0. one time-ordered frame ────────────────────────────────────────────
     parts = []
@@ -145,6 +167,7 @@ def run_feature_pipeline_v2(
     base_cols = [c for c in df.columns]
     y = df["isFraud"].to_numpy(dtype=np.float64)
     prior = float(np.nanmean(y[is_train]))
+    events = label_ready_times(y, df["TransactionID"].to_numpy(), t, policy)   # when each label becomes usable
     families: Dict[str, List[str]] = {}
     feats: Dict[str, np.ndarray] = {}
     hmm_params: Dict = {}
@@ -167,11 +190,9 @@ def run_feature_pipeline_v2(
     if cfg["use_graph_features"]:
         add("graph", add_graph_features(df, t, mode))
     if cfg["use_network_v4"]:
-        add("network_v4", add_network_v4(df, t, y, cfg["label_delay_days"], cfg["label_smoothing"],
-                                         prior, cfg["hub_cap"]))
+        add("network_v4", add_network_v4(df, t, events, cfg["label_smoothing"], prior, cfg["hub_cap"]))
     if cfg["use_label_history"]:
-        add("label_history", add_label_history(df, t, y, cfg["label_delay_days"],
-                                               cfg["label_smoothing"], prior))
+        add("label_history", add_label_history(df, t, events, cfg["label_smoothing"], prior))
     df = pd.concat([df, pd.DataFrame(feats, index=df.index)], axis=1)
     del feats
     gc.collect()                                   # release the feature arrays (now inside df)
@@ -180,7 +201,7 @@ def run_feature_pipeline_v2(
     # integer client id kept as a NON-feature column (folds, post-processing, CP@k)
     df["uid1_code"] = make_codes(df, "uid1")
     df = df.drop(columns=[c for c in KEY_COLS if c in df.columns])
-    df, label_maps = label_encode_strings(df, exclude=["split"])
+    df, label_maps = label_encode_strings(df, exclude=["split"], fit_mask=is_train)   # categories from train rows only
     feature_cols: List[str] = [c for c in df.columns if c not in NON_FEATURES and c != "uid1_code"]
     constant = [c for c in feature_cols if df.loc[is_train, c].nunique(dropna=False) <= 1]
     feature_cols = [c for c in feature_cols if c not in constant]
@@ -199,6 +220,7 @@ def run_feature_pipeline_v2(
         "dropped_v_cols": [c for c in all_v if c not in kept_v],
         "hmm_params": hmm_params if cfg["use_hmm_features"] else {},
         "fe_cfg": cfg,
+        "label_policy": policy.to_dict(),
         "feature_cols": feature_cols,
         "catboost_cat_cols": [c for c in CATBOOST_CAT_COLS if c in feature_cols],
         "kept_v_cols": kept_v,
