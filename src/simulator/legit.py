@@ -1,15 +1,18 @@
 """
 Legitimate customer behaviour (fully vectorised).
 
-* timing  : Poisson sessions per customer (gamma-distributed rates), weekly cycle,
+* timing  : Poisson sessions per customer (gamma-distributed rates) spread over days by the
+            population calendar (weekly cycle, paydays, holidays; see seasonality.py),
             a personal peak hour mixed with a global diurnal curve (local time),
             sessions of 1+ purchases minutes apart (legit traffic is bursty too, so
-            velocity alone must not separate fraud);
+            velocity alone must not separate fraud); new accounts get early promo activity;
+* recurring: monthly subscriptions / bills (fixed amount, card-on-file, merchant-initiated);
 * where   : 55% habitual merchants, otherwise MCC by personal preference, local shops
             in the current city (home or trip destination) or online stores;
 * amounts : lognormal per MCC, shifted by a personal spend level;
 * identity: current device (new phones are acquired mid-period), home broadband /
-            shared mobile CGNAT / VPN IPs, trips move IP and card-present location.
+            shared mobile CGNAT / VPN IPs, trips move IP and card-present location;
+            a share of e-commerce rows are guest checkouts (customer id hidden).
 """
 from __future__ import annotations
 
@@ -64,6 +67,53 @@ def mobile_ip(rng, world: World, city: np.ndarray) -> np.ndarray:
     return _pool_ip(rng, world.mobile_pool, len(world.cities), city)
 
 
+_SUB_MCCS = {"streaming": 0.38, "telecom": 0.22, "digital_goods": 0.18, "games": 0.12, "donations": 0.10}
+_SUB_PRICES = {"streaming": [4.99, 7.99, 9.99, 11.99, 15.49, 17.99], "digital_goods": [2.99, 4.99, 9.99, 14.99],
+               "games": [4.99, 9.99, 14.99], "donations": [5.0, 10.0, 25.0, 50.0]}
+
+
+def _subscriptions(world: World, rng: np.random.Generator) -> dict | None:
+    """Monthly recurring billing: fixed amount, fixed day-of-month (31 = month end), card on file."""
+    cfg, C, mccs = world.cfg, world.customers, world.mccs
+    nc, T = cfg.n_customers, cfg.horizon_sec
+    if cfg.subscription_share <= 0:
+        return None
+    subbed = np.nonzero(rng.random(nc) < cfg.subscription_share)[0]
+    n_sub = 1 + np.minimum(rng.poisson(0.4, len(subbed)), 3)
+    cust = np.repeat(subbed, n_sub)
+    names = list(_SUB_MCCS)
+    mcc_of = {n: int(np.nonzero(mccs["name"].to_numpy() == n)[0][0]) for n in names}
+    pick = rng.choice(len(names), len(cust), p=np.array(list(_SUB_MCCS.values())))
+    mcc = np.array([mcc_of[names[k]] for k in pick])
+    merchant, _ = world.picker.pick(rng, mcc, C["city"][cust], np.ones(len(cust), bool))
+    price = np.empty(len(cust))
+    for k, n in enumerate(names):
+        m = pick == k
+        price[m] = (rng.choice(_SUB_PRICES[n], m.sum()) if n in _SUB_PRICES
+                    else np.round(rng.uniform(25, 120, m.sum())) - 0.01)
+    dom = rng.choice([1, 3, 5, 8, 10, 12, 15, 18, 20, 22, 25, 28, 31], len(cust))
+    hour = rng.choice([0, 1, 2, 3, 4, 5, 12], len(cust)) * 3600 + rng.integers(0, 1800, len(cust))
+    start = np.maximum(C["open_t"][cust], 0) + rng.uniform(0, 30 * 86_400, len(cust))
+    cancel = np.where(rng.random(len(cust)) < 0.25, rng.uniform(0, T, len(cust)), np.inf)
+    ms, ml = world.month_starts[:-1], world.month_lens[:-1]
+    nm = len(ms)
+    si = np.repeat(np.arange(len(cust)), nm)
+    mi = np.tile(np.arange(nm), len(cust))
+    day = ms[mi] + np.minimum(dom[si], ml[mi]) - 1
+    t = day * 86_400 + hour[si]
+    ok = (t >= start[si]) & (t < cancel[si]) & (t >= 0) & (t < T)
+    t, si = t[ok], si[ok]
+    n = len(t)
+    return dict(t=t.astype(np.int64), customer=cust[si], card=C["card_start"][cust[si]],
+                merchant=merchant[si], terminal=world.merchants["term_start"][merchant[si]],
+                counterparty=np.full(n, -1, np.int64), channel=np.full(n, "CNP", dtype=object),
+                pos_entry_mode=np.full(n, "card_on_file", dtype=object), value_usd=price[si],
+                device=np.full(n, -1, np.int64), ip=np.full(n, -1, np.int64),
+                email_domain=np.full(n, None, dtype=object), shipping_country=np.full(n, -1, np.int64),
+                cred_type=np.full(n, "card_on_file", dtype=object),
+                recurring=np.ones(n, np.int8), guest=np.zeros(n, np.int8))
+
+
 def generate_legit(world: World, rng: np.random.Generator) -> dict:
     cfg = world.cfg
     C, M, mccs = world.customers, world.merchants, world.mccs
@@ -71,15 +121,21 @@ def generate_legit(world: World, rng: np.random.Generator) -> dict:
     nc = cfg.n_customers
     open_t = C["open_t"][:nc]
     a0 = np.maximum(open_t, 0)
-    active_days = (T - a0) / 86_400
     sess_mean = 4 / 3
-    n_sess = rng.poisson(C["rate"][:nc] * active_days / sess_mean * 1.4)
-
+    cdf = np.concatenate([[0.0], np.cumsum(world.cal_w)])
+    d0 = np.floor(a0 / 86_400).astype(np.int64).clip(0, cfg.n_days - 1)
+    active_w = cdf[cfg.n_days] - cdf[d0]
+    n_sess = rng.poisson(C["rate"][:nc] * active_w / sess_mean)
     cust = np.repeat(np.arange(nc), n_sess)
-    day = np.floor((a0[cust] + rng.random(len(cust)) * (T - a0[cust])) / 86_400).astype(np.int64)
-    dow = (day + world.start_dow) % 7
-    keep = rng.random(len(cust)) < np.where(dow >= 5, C["weekend_factor"][cust], 1.0) / 1.4
-    cust, day = cust[keep], day[keep]
+    u = cdf[d0[cust]] + rng.random(len(cust)) * active_w[cust]
+    day = np.maximum(np.searchsorted(cdf, u, side="right") - 1, d0[cust]).clip(0, cfg.n_days - 1)
+    # early-life promo activity for accounts opened during the horizon
+    new_acc = np.nonzero(open_t > 0)[0]
+    n_extra = rng.poisson(C["rate"][new_acc] * (cfg.promo_boost - 1) * cfg.promo_days / sess_mean)
+    c2 = np.repeat(new_acc, n_extra)
+    d2 = (d0[c2] + np.floor(rng.random(len(c2)) * cfg.promo_days)).astype(np.int64).clip(0, cfg.n_days - 1)
+    cust = np.concatenate([cust, c2])
+    day = np.concatenate([day, d2])
     n = len(cust)
     habit = rng.random(n) < 0.65
     hour = np.where(habit,
@@ -154,7 +210,7 @@ def generate_legit(world: World, rng: np.random.Generator) -> dict:
     pos = np.empty(n, dtype=object)
     pos[cp] = rng.choice(["chip", "contactless", "swipe", "keyed"], cp.sum(), p=[0.60, 0.33, 0.05, 0.02])
     is_cnp = channel == "CNP"
-    pos[is_cnp] = rng.choice(["ecom", "card_on_file", "moto"], is_cnp.sum(), p=[0.75, 0.20, 0.05])
+    pos[is_cnp] = rng.choice(["ecom", "card_on_file", "moto"], is_cnp.sum(), p=[0.84, 0.11, 0.05])
     pos[is_p2p] = "p2p"
 
     n_cards = C["n_cards"][cust]
@@ -165,6 +221,8 @@ def generate_legit(world: World, rng: np.random.Generator) -> dict:
     mcc = M["mcc_idx"][merchant]
     mu = np.where(mcc >= 0, mccs["mu"].to_numpy()[mcc.clip(0)], 3.9) + C["spend_offset"][cust]
     sg = np.where(mcc >= 0, mccs["sigma"].to_numpy()[mcc.clip(0)], 0.9)
+    mu = np.where(is_p2p, 4.6 + C["spend_offset"][cust], mu)       # transfers are bigger and more spread out
+    sg = np.where(is_p2p, 1.0, sg)
     value = np.exp(mu + sg * rng.normal(0, 1, n))
 
     # device & IP (online channels only)
@@ -177,12 +235,12 @@ def generate_legit(world: World, rng: np.random.Generator) -> dict:
 
     ip = np.full(n, -1, dtype=np.int64)
     u = rng.random(len(d))
-    ip_d = np.where(u < 0.66, home_ip(world, cust[d], t[d]), -1)
-    mob = (u >= 0.66) & (u < 0.88)
+    ip_d = np.where(u < 0.62, home_ip(world, cust[d], t[d]), -1)
+    mob = (u >= 0.62) & (u < 0.84)
     ip_d[mob] = mobile_ip(rng, world, C["city"][cust[d][mob]])
-    wifi = (u >= 0.88) & (u < 0.94)
+    wifi = (u >= 0.84) & (u < 0.90)
     ip_d[wifi] = _pool_ip(rng, world.wifi_pool, len(world.cities), C["city"][cust[d][wifi]])
-    vpn = u >= 0.94
+    vpn = u >= 0.90
     ip_d[vpn] = rng.choice(world.vpn_pool, vpn.sum())
     trip_d = in_trip[d]
     ip_d[trip_d] = mobile_ip(rng, world, cur_city[d][trip_d])
@@ -190,14 +248,31 @@ def generate_legit(world: World, rng: np.random.Generator) -> dict:
     p_null_ip = np.select([pos == "card_on_file", pos == "moto"], [0.5, 1.0], 0.0)
     ip[digital & (rng.random(n) < p_null_ip)] = -1
 
-    email = np.where(digital, C["email"][cust], None).astype(object)
+    ch_t = C["email_change_t"][cust]
+    email_now = np.where(t >= np.nan_to_num(ch_t, nan=1e18), C["email2"][cust], C["email"][cust])
+    email = np.where(digital, email_now, None).astype(object)
     phys = np.where(mcc >= 0, mccs["physical"].to_numpy()[mcc.clip(0)], False)
     ship = np.full(n, -1, dtype=np.int64)
-    s = is_cnp & phys
-    ship[s] = np.where(rng.random(s.sum()) < 0.96, C["country"][cust[s]],
-                       rng.integers(0, len(world.countries), s.sum()))
+    s_ = is_cnp & phys
+    ship[s_] = np.where(rng.random(s_.sum()) < 0.96, C["country"][cust[s_]],
+                        rng.integers(0, len(world.countries), s_.sum()))
     cred = np.where(cp, "card_present", np.where(pos == "card_on_file", "card_on_file", "owner")).astype(object)
+    guest = ((pos == "ecom") & (rng.random(n) < cfg.guest_checkout_share)).astype(np.int8)
 
-    return dict(t=t, customer=cust, card=card, merchant=merchant, terminal=terminal,
-                counterparty=counterparty, channel=channel, pos_entry_mode=pos, value_usd=value,
-                device=device, ip=ip, email_domain=email, shipping_country=ship, cred_type=cred)
+    out = dict(t=t, customer=cust, card=card, merchant=merchant, terminal=terminal,
+               counterparty=counterparty, channel=channel, pos_entry_mode=pos, value_usd=value,
+               device=device, ip=ip, email_domain=email, shipping_country=ship, cred_type=cred,
+               recurring=np.zeros(n, np.int8), guest=guest)
+    subs = _subscriptions(world, rng)
+    if subs is not None and len(subs["t"]):
+        out = {k_: np.concatenate([out[k_], subs[k_]]) for k_ in out}
+        order = np.argsort(out["t"], kind="stable")
+        out = {k_: v[order] for k_, v in out.items()}
+    # merchant onboarding: ~15% of merchants launch during the horizon (no sales before launch); the rest
+    # are long-standing. A young merchant is therefore ordinary, not a fraud flag.
+    n_m = len(M["mode"])
+    launch = np.where(rng.random(n_m) < 0.15, rng.uniform(0.02, 0.95, n_m) * T, -rng.lognormal(np.log(700), 0.8, n_m) * 86_400)
+    keep = out["t"] >= launch[out["merchant"]]
+    out = {k_: v[keep] for k_, v in out.items()}
+    M["open_t"] = launch - rng.uniform(0, 2 * 86_400, n_m) * (launch > 0)
+    return out

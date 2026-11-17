@@ -1,19 +1,17 @@
 """
-Agent-based synthetic payments world ("Track C", docs/IMPROVEMENT_PLAN.md Phase 9).
+Agent-based synthetic payments world (v2): a closed-loop stand-in for a real payment system.
 
-A SEPARATE simulated dataset with the real-world fields IEEE-CIS lacks (customer /
-merchant / terminal ids, MCC, IP + geolocation, device ids, AVS / CVC / 3DS, ISO 8583
-response codes, chargeback dates). It is never joined to IEEE-CIS rows.
+Customers, merchants, terminals, devices, IPs; attacker agents (gangs, rings, crews, synthetic
+identities, colluding merchants) that ADAPT to the decisions of a pluggable ``DecisionPolicy``;
+delayed, selective, noisy labels; card reissue; an account-event stream. Never joined to IEEE-CIS.
 
-Fraud is not stamped onto rows after the fact: attacker agents (gangs, rings,
-crews) generate their own transactions, and the label is "which process produced the
-row". Authorisation outcomes come from mechanisms (CVC fail -> N7, 3DS fail -> 05, ...)
-that apply identically to legit and fraud rows.
-
-Entry point: ``simulate(SimConfig(...))`` -> ``SimResult`` (see world.py), or
-``scripts/run_simulator.py``.
+Entry point: ``simulate(SimConfig.from_preset("realistic"), policy=...)`` -> ``SimResult`` (world.py),
+or ``scripts/run_simulator.py``. See docs/SYNTHETIC_DATA.md.
 """
-from .config import SimConfig
+from .config import PRESETS, SimConfig
+from .loop import (ACTIONS, AllApprovePolicy, CallablePolicy, DecisionPolicy, Decisions, EpochBatch,
+                   RulesPolicy, ScorePolicy)
 from .world import SimResult, simulate
 
-__all__ = ["SimConfig", "SimResult", "simulate"]
+__all__ = ["SimConfig", "PRESETS", "SimResult", "simulate", "DecisionPolicy", "Decisions", "EpochBatch",
+           "RulesPolicy", "ScorePolicy", "CallablePolicy", "AllApprovePolicy", "ACTIONS"]

@@ -19,8 +19,8 @@ from .entities import World
 AVS = {
     "owner":            (["Y", "A", "Z", "N", "U"], [0.86, 0.04, 0.04, 0.02, 0.04]),
     "card_on_file":     (["Y", "A", "Z", "N", "U"], [0.95, 0.02, 0.02, 0.00, 0.01]),
-    "stolen_full":      (["Y", "A", "Z", "N", "U"], [0.55, 0.10, 0.10, 0.15, 0.10]),
-    "stolen_partial":   (["Y", "A", "Z", "N", "U"], [0.10, 0.10, 0.20, 0.40, 0.20]),
+    "stolen_full":      (["Y", "A", "Z", "N", "U"], [0.76, 0.07, 0.07, 0.05, 0.05]),
+    "stolen_partial":   (["Y", "A", "Z", "N", "U"], [0.20, 0.12, 0.22, 0.30, 0.16]),
     "enumerated_valid": (["Y", "A", "Z", "N", "U"], [0.02, 0.03, 0.05, 0.60, 0.30]),
     "invalid_pan":      (["Y", "A", "Z", "N", "U"], [0.00, 0.00, 0.00, 0.50, 0.50]),
 }
@@ -28,8 +28,8 @@ AVS = {
 CVC = {
     "owner":            (["M", "N", "P"], [0.95, 0.01, 0.04]),
     "card_on_file":     (["M", "N", "P"], [0.10, 0.00, 0.90]),
-    "stolen_full":      (["M", "N", "P"], [0.85, 0.05, 0.10]),
-    "stolen_partial":   (["M", "N", "P"], [0.15, 0.45, 0.40]),
+    "stolen_full":      (["M", "N", "P"], [0.90, 0.03, 0.07]),
+    "stolen_partial":   (["M", "N", "P"], [0.25, 0.35, 0.40]),
     "enumerated_valid": (["M", "N", "P"], [0.10, 0.70, 0.20]),
     "invalid_pan":      (["M", "N", "P"], [0.00, 0.50, 0.50]),
 }
@@ -37,8 +37,9 @@ CVC = {
 # N authentication failed, R rejected
 THREE_DS = {
     "owner":            (["Y", "C", "A", "N", "R"], [0.86, 0.09, 0.02, 0.02, 0.01]),
-    "stolen_full":      (["Y", "C", "A", "N", "R"], [0.35, 0.25, 0.05, 0.30, 0.05]),
-    "stolen_partial":   (["Y", "C", "A", "N", "R"], [0.20, 0.20, 0.00, 0.50, 0.10]),
+    "stolen_full":      (["Y", "C", "A", "N", "R"], [0.62, 0.20, 0.04, 0.10, 0.04]),
+    "card_on_file":     (["Y", "C", "A", "N", "R"], [0.66, 0.18, 0.04, 0.09, 0.03]),   # ATO on a stored card, ecom flow
+    "stolen_partial":   (["Y", "C", "A", "N", "R"], [0.30, 0.25, 0.02, 0.35, 0.08]),
     "enumerated_valid": (["Y", "C", "A", "N", "R"], [0.10, 0.00, 0.00, 0.60, 0.30]),
     "invalid_pan":      (["Y", "C", "A", "N", "R"], [0.00, 0.00, 0.00, 0.40, 0.60]),
 }
@@ -101,11 +102,16 @@ def apply_auth(core: pd.DataFrame, world: World, rng: np.random.Generator):
         code[sel] = c if np.ndim(c) == 0 else np.asarray(c)[sel]
 
     u = lambda: rng.random(n)  # noqa: E731
-    decline(cred == "invalid_pan", np.where(u() < 0.8, "14", "54"))
+    decline(cred == "invalid_pan", np.where(u() < 0.75, "14", "54"))
     decline((cvc == "N") & (u() < 0.9), "N7")
     decline(np.isin(tds, ["N", "R"]) & (u() < 0.95), "05")
     decline((avs == "N") & (u() < 0.15), "05")
     p59 = 0.002 + 0.03 * foreign_ip + 0.03 * hosting + 0.02 * (z > 2.5) + 0.01 * np.isin(pos, ["swipe", "keyed"])
+    # realistic legit declines that look like "attack" codes: mistyped PANs (14) and expired /
+    # closed cards (54) happen to ordinary customers at a rate comparable to fraud attempts
+    real_pan = cred != "invalid_pan"
+    decline(real_pan & cnp & (u() < 0.0018), "14")
+    decline(real_pan & (u() < 0.0025), "54")
     decline(u() < p59, "59")
     p51 = 0.006 + 0.12 / (1 + np.exp(-(z - 3))) + 0.02 * prepaid
     decline(u() < p51, "51")

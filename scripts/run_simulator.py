@@ -1,11 +1,12 @@
 """
 Generate the synthetic payments world (Track C) and its data card.
 
-    venv/Scripts/python.exe scripts/run_simulator.py --out data/synthetic/v1
+    venv/Scripts/python.exe scripts/run_simulator.py --out data/synthetic/v2                 # realistic preset
+    venv/Scripts/python.exe scripts/run_simulator.py --preset hard --out data/synthetic/v2_hard
     venv/Scripts/python.exe scripts/run_simulator.py --small --out data/synthetic/smoke
     venv/Scripts/python.exe scripts/run_simulator.py --config configs/config.yaml   # uses a `simulator:` section if present
 
-Writes <out>/transactions.parquet, entities/, ground_truth/, metadata.json,
+Writes <out>/transactions.parquet, events.parquet, entities/, ground_truth/, metadata.json,
 validation.json and data_card.md. Nothing here trains a model.
 """
 from __future__ import annotations
@@ -26,12 +27,15 @@ from src.simulator.validate import ieee_reference, validate  # noqa: E402
 
 def main() -> None:
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    ap.add_argument("--out", default="data/synthetic/v1")
+    ap.add_argument("--out", default="data/synthetic/v2")
+    ap.add_argument("--preset", default=None, help="realistic (default) | realistic_dense | ieee_like | hard")
     ap.add_argument("--config", help="YAML file; its `simulator:` section overrides defaults")
     ap.add_argument("--small", action="store_true", help="quick world (~40k rows)")
     ap.add_argument("--seed", type=int)
     ap.add_argument("--n-customers", type=int)
     ap.add_argument("--n-days", type=int)
+    ap.add_argument("--n-merchants", type=int)
+    ap.add_argument("--no-ceiling", action="store_true", help="skip the row-only model check")
     ap.add_argument("--ieee-csv", default="data/raw/train_transaction.csv",
                     help="IEEE-CIS train_transaction.csv for aggregate fidelity stats ('' to skip)")
     ap.add_argument("--no-validate", action="store_true")
@@ -41,11 +45,14 @@ def main() -> None:
     if args.config:
         import yaml
         overrides.update((yaml.safe_load(Path(args.config).read_text(encoding="utf-8")) or {}).get("simulator") or {})
-    for k in ("seed", "n_customers", "n_days"):
+    if args.preset:
+        overrides["preset"] = args.preset
+    for k in ("seed", "n_customers", "n_days", "n_merchants"):
         v = getattr(args, k)
         if v is not None:
             overrides[k] = v
     cfg = SimConfig.small(**overrides) if args.small else SimConfig.from_dict(overrides)
+    print(f"[sim] preset {cfg.preset}: {cfg.n_customers:,} customers x {cfg.n_days} days")
 
     out = (ROOT / args.out) if not Path(args.out).is_absolute() else Path(args.out)
     t0 = time.time()
@@ -71,11 +78,17 @@ def main() -> None:
                 ref = ieee_reference(ieee)
                 cache.write_text(json.dumps(ref, indent=2))
         t1 = time.time()
-        report = validate(res, ref)
+        report = validate(res, ref, ceiling=not args.no_ceiling)
         (out / "validation.json").write_text(json.dumps(report, indent=2, default=str), encoding="utf-8")
         print(f"[sim] validation done in {time.time() - t1:.0f}s; structure: {report['structure']}")
         flagged = [r["column"] for r in report["leakage"] if r["flag"]]
         print(f"[sim] leakage flags (single-column AUC >= 0.85): {flagged or 'none'}")
+        print(f"[sim] purity: {'PASS' if report['purity']['pass'] else report['purity']['violations'][:5]}")
+        ce = report.get("row_only_ceiling")
+        if ce:
+            print(f"[sim] row-only ceiling: AUC {ce['overall_auc']:.3f}, per scenario "
+                  f"{ {k: v['auc'] for k, v in ce['per_scenario'].items()} } -> {'PASS' if ce['pass'] else 'FAIL'}")
+        print(f"[sim] calibration pass rate: {report['calibration_pass_rate']:.0%}")
     (out / "data_card.md").write_text(render(res.metadata, report), encoding="utf-8")
     print(f"[sim] wrote {out}")
 

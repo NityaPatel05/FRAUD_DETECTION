@@ -20,11 +20,20 @@ CORE = {
     "email_domain": (object, None),
     "shipping_country": (np.int64, -1),
     "cred_type": (object, None),        # what the payer actually holds (drives AVS/CVC/3DS)
-    "is_fraud": (np.int8, 0),
+    "is_fraud": (np.int8, 0),           # ground truth: produced by a fraud process
     "scenario": (object, "legit"),
     "incident": (np.int64, -1),
     "ring": (np.int64, -1),
-    "delay_days": (np.float64, np.nan),  # label delay; set for fraud rows
+    "recurring": (np.int8, 0),          # merchant-initiated scheduled charge
+    "txn_type": (object, "purchase"),   # purchase / refund
+    "guest": (np.int8, 0),              # guest checkout: customer id hidden
+    "refund_of": (np.int64, -1),        # uid of the purchase a refund belongs to
+    "role": (object, None),             # mule-ring row role (victim / layer / cashout)
+    "gang": (np.int64, -1),             # attacker group (for closed-loop feedback)
+    "tac_ip": (np.int8, -1),            # tactic arms used by the attacker (feedback / bandit)
+    "tac_amt": (np.int8, -1),
+    "tac_mg": (np.int8, -1),
+    "tac_aged": (np.int8, -1),
 }
 
 

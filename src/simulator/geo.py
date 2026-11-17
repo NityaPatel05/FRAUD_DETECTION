@@ -18,13 +18,13 @@ _COUNTRIES = [
     ("MX", "MXN", 0.058,   2, 0.008, 0.005, 0.06, False, False),
     ("DE", "EUR", 1.08,    2, 0.004, 0.015, 0.03, False, True),
     ("FR", "EUR", 1.08,    2, 0.003, 0.01, 0.03, False, True),
-    ("IN", "INR", 0.012,   2, 0.003, 0.005, 0.07, False, False),
-    ("BR", "BRL", 0.20,    2, 0.002, 0.005, 0.12, False, False),
-    ("NG", "NGN", 0.00065, 2, 0.0005, 0.0, 0.12, False, False),
-    ("RO", "RON", 0.22,    2, 0.0005, 0.0, 0.12, False, True),
-    ("RU", "RUB", 0.011,   2, 0.0005, 0.0, 0.12, False, False),
-    ("CN", "CNY", 0.14,    2, 0.0015, 0.015, 0.08, False, False),
-    ("PH", "PHP", 0.018,   2, 0.001, 0.0, 0.06, False, False),
+    ("IN", "INR", 0.012,   2, 0.006, 0.005, 0.07, False, False),
+    ("BR", "BRL", 0.20,    2, 0.006, 0.005, 0.12, False, False),
+    ("NG", "NGN", 0.00065, 2, 0.003, 0.0, 0.12, False, False),
+    ("RO", "RON", 0.22,    2, 0.003, 0.0, 0.12, False, True),
+    ("RU", "RUB", 0.011,   2, 0.004, 0.0, 0.12, False, False),
+    ("CN", "CNY", 0.14,    2, 0.004, 0.015, 0.08, False, False),
+    ("PH", "PHP", 0.018,   2, 0.004, 0.0, 0.06, False, False),
     ("JP", "JPY", 0.0067,  0, 0.0015, 0.01, 0.01, False, False),
     ("AU", "AUD", 0.66,    2, 0.002, 0.005, 0.02, False, False),
 ]
@@ -77,27 +77,52 @@ _MCCS = [
 ]
 P2P_MCC = "4829"  # money transfer platform (not part of the shopping MCC mix)
 
-LEGIT_EMAIL = (["gmail.com", "yahoo.com", "hotmail.com", "outlook.com", "icloud.com", "aol.com",
-                "comcast.net", "att.net", "msn.com", "live.com"],
-               [0.45, 0.14, 0.09, 0.08, 0.08, 0.04, 0.04, 0.03, 0.03, 0.02])
-FRAUD_EMAIL = (["gmail.com", "yahoo.com", "outlook.com", "hotmail.com", "protonmail.com",
-                "mail.ru", "yandex.ru", "guerrillamail.com", "tutanota.com", "icloud.com"],
-               [0.36, 0.10, 0.10, 0.08, 0.10, 0.06, 0.05, 0.06, 0.04, 0.05])
+# Legit customers use EVERY domain a fraudster might (privacy providers, throwaway mail, locale
+# providers): a domain must never be a deterministic fraud flag (audit finding 1).
+_EMAIL_DOMAINS = ["gmail.com", "yahoo.com", "hotmail.com", "outlook.com", "icloud.com", "aol.com",
+                  "comcast.net", "att.net", "msn.com", "live.com", "protonmail.com", "mail.ru",
+                  "yandex.ru", "guerrillamail.com", "tutanota.com"]
+LEGIT_EMAIL = (_EMAIL_DOMAINS,
+               [0.430, 0.130, 0.085, 0.075, 0.075, 0.035, 0.035, 0.025, 0.025, 0.018,
+                0.030, 0.012, 0.008, 0.007, 0.010])
+# locale-specific legit use (RU / ex-USSR customers really do use mail.ru and yandex)
+LOCALE_EMAIL = {
+    "RU": [0.20, 0.03, 0.01, 0.02, 0.02, 0.0, 0.0, 0.0, 0.0, 0.0, 0.02, 0.40, 0.28, 0.01, 0.01],
+    "RO": [0.60, 0.10, 0.06, 0.06, 0.04, 0.0, 0.0, 0.0, 0.0, 0.0, 0.02, 0.05, 0.04, 0.01, 0.02],
+    "CN": [0.15, 0.02, 0.02, 0.10, 0.05, 0.0, 0.0, 0.0, 0.0, 0.10, 0.02, 0.02, 0.02, 0.0, 0.0],
+}
+FRAUD_EMAIL = (_EMAIL_DOMAINS,
+               [0.434, 0.115, 0.075, 0.072, 0.065, 0.030, 0.028, 0.020, 0.020, 0.014,
+                0.050, 0.025, 0.017, 0.020, 0.015])
 
-DEVICE_OS = (["iOS", "Android", "Windows", "macOS", "Linux"], [0.38, 0.30, 0.20, 0.10, 0.02])
-FRAUD_DEVICE_OS = (["iOS", "Android", "Windows", "macOS", "Linux"], [0.18, 0.40, 0.27, 0.05, 0.10])
+DEVICE_OS = (["iOS", "Android", "Windows", "macOS", "Linux"], [0.37, 0.29, 0.19, 0.10, 0.05])
+FRAUD_DEVICE_OS = (["iOS", "Android", "Windows", "macOS", "Linux"], [0.31, 0.33, 0.22, 0.09, 0.05])
 BROWSER_BY_OS = {
     "iOS": (["Safari", "Chrome", "App"], [0.55, 0.15, 0.30]),
     "Android": (["Chrome", "Samsung Internet", "App"], [0.55, 0.15, 0.30]),
     "Windows": (["Chrome", "Edge", "Firefox"], [0.65, 0.25, 0.10]),
     "macOS": (["Safari", "Chrome", "Firefox"], [0.50, 0.45, 0.05]),
-    "Linux": (["Chrome", "Firefox", "Headless Chrome"], [0.50, 0.35, 0.15]),
+    # developers, scrapers/aggregators and monitoring bots are legit Linux/headless traffic too
+    "Linux": (["Chrome", "Firefox", "Headless Chrome"], [0.45, 0.33, 0.22]),
 }
 
 # Hourly profile of activity in LOCAL time (shape similar to IEEE-CIS: quiet 2-7am).
 GLOBAL_HOURLY = np.array([2.2, 1.4, 0.9, 0.6, 0.5, 0.6, 1.0, 1.8, 2.8, 3.8, 4.6, 5.2,
                           5.6, 5.8, 5.8, 5.9, 6.0, 6.0, 5.9, 5.7, 5.3, 4.6, 3.8, 3.0])
 GLOBAL_HOURLY = GLOBAL_HOURLY / GLOBAL_HOURLY.sum()
+
+
+def email_probs(country_codes: np.ndarray) -> np.ndarray:
+    """(n, n_domains) legit email-domain probabilities per customer country."""
+    base = np.asarray(LEGIT_EMAIL[1], float)
+    base = base / base.sum()
+    out = np.tile(base, (len(country_codes), 1))
+    for code, p in LOCALE_EMAIL.items():
+        m = np.asarray(country_codes) == code
+        if m.any():
+            p = np.asarray(p, float)
+            out[m] = 0.85 * p / p.sum() + 0.15 * base
+    return out
 
 
 def countries_df() -> pd.DataFrame:

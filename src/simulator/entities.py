@@ -15,7 +15,7 @@ from typing import Dict
 import numpy as np
 import pandas as pd
 
-from . import geo
+from . import geo, seasonality
 from .config import SimConfig
 
 NEG_INF = -1e15
@@ -190,6 +190,9 @@ class World:
     picker: MerchantPicker = None
     start_dow: int = 0
     bins_by_key: dict = field(default_factory=dict)
+    cal_w: np.ndarray = None        # legit demand multiplier per day
+    month_starts: np.ndarray = None
+    month_lens: np.ndarray = None
 
     # ── entity factories used by both legit and fraud generation ──
     def new_ips(self, rng, country: np.ndarray, city: np.ndarray, kind: str) -> np.ndarray:
@@ -280,9 +283,14 @@ def build_world(cfg: SimConfig, rng: np.random.Generator) -> World:
     city = world.city_of_country(rng, country)
     age0 = np.clip(rng.lognormal(np.log(900), 0.9, nc), 1, 9000)
     open_t = -age0 * 86_400
-    new = rng.random(nc) < 0.08
-    open_t[new] = rng.uniform(0, 0.9 * T, new.sum())
-    email = rng.choice(geo.LEGIT_EMAIL[0], nc, p=geo.LEGIT_EMAIL[1]).astype(object)
+    new = rng.random(nc) < cfg.new_account_frac
+    open_t[new] = rng.uniform(0, 0.97 * T, new.sum())
+    code_of = countries["code"].to_numpy()
+    ep = geo.email_probs(code_of[country])
+    email = np.asarray(geo.LEGIT_EMAIL[0], dtype=object)[(ep.cumsum(axis=1) < rng.random((nc, 1))).sum(axis=1).clip(0, len(geo.LEGIT_EMAIL[0]) - 1)]
+    # ~4% of customers change their email address once during the horizon (legit account events)
+    email_change_t = np.where(rng.random(nc) < 0.04 * cfg.n_days / 365, rng.uniform(0.05, 0.95, nc) * T, np.nan)
+    email2 = rng.choice(geo.LEGIT_EMAIL[0], nc, p=geo.LEGIT_EMAIL[1]).astype(object)
 
     # households: ~25% of customers share their address with someone in the same city
     address = np.arange(nc, dtype=np.int64)
@@ -303,7 +311,10 @@ def build_world(cfg: SimConfig, rng: np.random.Generator) -> World:
     network = rng.choice(["visa", "mastercard", "amex", "discover"], ncard, p=[0.55, 0.30, 0.10, 0.05]).astype(object)
     ctype = rng.choice(["debit", "credit", "prepaid"], ncard, p=[0.58, 0.37, 0.05]).astype(object)
     world.cards = Table(owner=card_owner, country=card_country, network=network, card_type=ctype,
-                        bin=world.random_bins(rng, card_country, network, ctype))
+                        bin=world.random_bins(rng, card_country, network, ctype),
+                        prev=np.full(ncard, -1, dtype=np.int64), succ=np.full(ncard, -1, dtype=np.int64),
+                        issued_t=np.full(ncard, NEG_INF), blocked_t=np.full(ncard, np.nan),
+                        reissue_t=np.full(ncard, np.nan))
 
     # devices: 1-3 per customer; extra devices are acquired during the simulation
     n_dev = 1 + np.minimum(rng.poisson(0.6, nc), 2)
@@ -343,11 +354,12 @@ def build_world(cfg: SimConfig, rng: np.random.Generator) -> World:
         hour_spread=rng.uniform(2.0, 5.0, nc),
         weekend_factor=rng.uniform(0.6, 1.4, nc),
         online=rng.beta(2, 2, nc) * 2,
-        p2p_share=np.where(rng.random(nc) < 0.25, rng.uniform(0.05, 0.2, nc), 0.0),
+        p2p_share=np.where(rng.random(nc) < 0.40, rng.uniform(0.05, 0.35, nc), 0.0),
         email=email, address=address,
         card_start=card_start, n_cards=n_cards, dev_start=dev_start, n_dev=n_dev,
         home_start=home_start, home_n=home_n, home_period=period, home_phase=phase,
         kind=np.full(nc, "regular", dtype=object), is_mule=np.zeros(nc, bool),
+        email_change_t=email_change_t, email2=email2, abandon_t=np.full(nc, POS_INF),
     )
     world.dev_acq = acq
 
@@ -393,7 +405,8 @@ def build_world(cfg: SimConfig, rng: np.random.Generator) -> World:
     n_term = np.where(mode == "omni", n_term + 1, n_term)
     term_start = np.concatenate([[0], np.cumsum(n_term)[:-1]])
     world.merchants = Table(mcc_idx=mcc_idx, mode=mode, city=m_city, uses_3ds=uses_3ds,
-                            popularity=popularity, term_start=term_start, n_term=n_term)
+                            popularity=popularity, term_start=term_start, n_term=n_term,
+                            open_t=np.full(len(mode), np.nan), kind=np.full(len(mode), "normal", dtype=object))
     t_merchant = np.repeat(np.arange(len(mode)), n_term)
     t_rank = np.arange(len(t_merchant)) - term_start[t_merchant]
     virtual = (mode[t_merchant] == "cnp") | (mode[t_merchant] == "p2p") | ((mode[t_merchant] == "omni") & (t_rank == 0))
@@ -437,4 +450,6 @@ def build_world(cfg: SimConfig, rng: np.random.Generator) -> World:
     prev_end = trips.groupby("cust")["end"].shift(1)
     trips = trips[~(trips["start"] < prev_end)].reset_index(drop=True)
     world.trips = trips
+    world.cal_w = seasonality.day_weights(cfg.start_date, cfg.n_days, cfg.calendar)
+    world.month_starts, world.month_lens = seasonality.month_table(cfg.start_date, cfg.n_days)
     return world
