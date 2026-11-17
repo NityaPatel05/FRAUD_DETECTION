@@ -37,6 +37,7 @@ What happens, in order (each step is an existing project script, so nothing is h
  14  final        refit on train+val → Kaggle test predictions (submission CSV)
  15  sim_generate simulated payments world (real-world fields IEEE lacks) → data/synthetic/v2_dense
  16  sim_train    train + evaluate on it: per-scenario recall, novel scenario, ring detection
+ 16b closed_loop  closed-loop experiments: selection bias/exploration, retraining, cost actions, novelty
  17  report       results/FINAL_REPORT.md
 
 THREE DATASET TRACKS, each run end-to-end, each in its own processes:
@@ -559,12 +560,19 @@ def build_steps(args, device: str) -> list:
             S.append(("sim_generate", False, [sim_gen]))
         S.append(("sim_train", False, [[PY, "scripts/run_sim_track.py", "--data", "data/synthetic/v2_dense", *dev]
                                        + (["--quick", "--max-customers", "15000"] if quick else [])]))
+        S.append(("closed_loop", False, [[PY, "scripts/run_closed_loop.py"]
+                                         + (["--quick"] if quick else ["--size", "full", "--seeds", "1", "2", "3", "4", "5"])]))
     return S
 
 
 # ─────────────────────────────────────────────────────────────────────────────
 # report
 # ─────────────────────────────────────────────────────────────────────────────
+
+def _nmean(xs):
+    v = [x for x in xs if isinstance(x, (int, float)) and x == x]
+    return sum(v) / len(v) if v else None
+
 
 def fmt(x, nd=4):
     return "—" if x is None else (f"{x:.{nd}f}" if isinstance(x, float) else str(x))
@@ -825,6 +833,55 @@ def build_report(state: dict) -> None:
         if rings:
             L += ["", f"Mule rings detected (at least one member flagged): **{rings['rings_detected']:.1%}** of {rings['n_rings']}"]
         L.append("")
+
+    cl = read_json(ROOT / "artifacts" / "v2" / "closed_loop" / "metrics.json")
+    if cl:
+        res["closed_loop"] = {k: v for k, v in cl.items() if k != "exp4_novelty"}
+        L += ["## Closed-loop experiments (simulator; the policy only learns from labels it was delivered)", "",
+              f"World size {cl.get('meta', {}).get('size')}, seeds {cl.get('meta', {}).get('seeds')}. Final-model "
+              "quality is scored on a fixed held-out stream with true labels.", ""]
+        e1 = (cl.get("exp1_selection_bias") or {}).get("summary") or {}
+        if e1:
+            L += ["**1. Selection bias vs exploration**", "", "| Arm | AUC-PR | Recall @1% FPR | Fraud loss $ | False declines |",
+                  "|---|---|---|---|---|"]
+            for arm, d in e1.items():
+                fm, sm = d.get("final_model") or {}, d.get("summary") or {}
+                L.append(f"| {arm} | {fmt(fm.get('auc_pr'))} | {fmt(fm.get('recall_at_1pct_fpr'))} | "
+                         f"{fmt(sm.get('fraud_loss_usd'), 0)} | {fmt(sm.get('false_declines'), 0)} |")
+            L.append("")
+        e2 = (cl.get("exp2_retraining") or {}).get("summary") or {}
+        if e2:
+            L += ["**2. Retraining strategy (adaptive attackers)**", "", "| Arm | Retrains | AUC-PR | Recall @1% FPR | Fraud loss $ |",
+                  "|---|---|---|---|---|"]
+            for arm, d in e2.items():
+                fm, sm = d.get("final_model") or {}, d.get("summary") or {}
+                L.append(f"| {arm} | {fmt(sm.get('n_retrains'), 1)} | {fmt(fm.get('auc_pr'))} | "
+                         f"{fmt(fm.get('recall_at_1pct_fpr'))} | {fmt(sm.get('fraud_loss_usd'), 0)} |")
+            L.append("")
+        e3 = (cl.get("exp3_cost") or {}).get("summary") or {}
+        if e3:
+            L += ["**3. Decision rule**", "", "| Arm | Net cost $ | Fraud loss $ | False declines | 3DS rate | Review rate |",
+                  "|---|---|---|---|---|---|"]
+            for arm, d in e3.items():
+                sm = d.get("summary") or {}
+                L.append(f"| {arm} | {fmt(sm.get('net_cost_usd'), 0)} | {fmt(sm.get('fraud_loss_usd'), 0)} | "
+                         f"{fmt(sm.get('false_declines'), 0)} | {fmt(sm.get('stepup_rate'))} | {fmt(sm.get('review_rate'))} |")
+            L.append("")
+        runs = (cl.get("exp4_novelty") or {}).get("runs") or []
+        if runs:
+            res["closed_loop"]["exp4_novelty_runs"] = runs
+            agg = {}
+            for r in runs:
+                a = agg.setdefault(r["arm"], [0, 0, [], []])
+                a[0] += r.get("n_detected", 0); a[1] += r.get("n_incidents", 0)
+                a[2].append(r.get("false_alarm_rate_per_week_pre_test", float("nan")))
+                a[3].append((r.get("supervised") or {}).get("bust_out_recall_at_1pct_fpr", float("nan")))
+            L += ["**4. Novel scenario (bust_out, test period only)**", "",
+                  "| Arm | Incidents detected by novelty layer | False alarms / week (pre-test) | Supervised bust_out recall @1% FPR |",
+                  "|---|---|---|---|"]
+            for arm, (d, n, fa, sr) in agg.items():
+                L.append(f"| {arm} | {d}/{n} | {fmt(_nmean(fa))} | {fmt(_nmean(sr))} |")
+            L.append("")
 
     fin = art("causal") / "submission_blend.csv"
     if fin.exists():

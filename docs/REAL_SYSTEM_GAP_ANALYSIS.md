@@ -10,6 +10,18 @@ Built from five parallel studies:
 
 The question it answers: is our weakness the data, the system, or both? And what does a real fraud system have that ours lacks?
 
+> **Status (2026-11-17): all phases implemented and pushed to main.** Results so far come from CPU runs on samples; the GPU run of `run_all.py` gives the full numbers.
+>
+> | Phase | Commit | Outcome |
+> |---|---|---|
+> | A1 offline fixes (runner sentinel, label policy, eval, blend, ablation) | 490fd5f | done |
+> | A2 serving safety (label policy online, idempotency, snapshot check) | 6a88dce | done |
+> | B simulator v2 (3-gate labels, closed loop, adaptation, presets) | 1fa78b5 | done |
+> | C1 sim track v2 (causal features, known-at-cutoff targets, true vs reported eval) | 7234a62 | test AP 0.83 true / 0.49 reported |
+> | D sequence embeddings | 7234a62 | **DROP**: no arm passes the keep rule (30% sample) |
+> | C2 serving latency fast path | 300a3be | p50 ~150 ms → ~5 ms (synthetic bundle) |
+> | C2 closed-loop experiments | see `docs/CLOSED_LOOP.md` | selection bias costs ~0.16 AUC-PR; exploration recovers little at this volume; PSI drift trigger misses sub-1% attacks; segment thresholds and cost actions beat a single threshold by 22–31% net cost |
+
 ---
 
 ## 1. Verdict: both, and they need different fixes
