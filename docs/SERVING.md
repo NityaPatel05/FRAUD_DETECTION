@@ -62,3 +62,55 @@ train+val history (or fails when `warmup=False`).
 
 Each bundle gets only its own features and casts them to the training dtype (`float32` unless the bundle says
 otherwise) before predicting, so tree splits match offline. Challenger shadow scores use the challenger's feature list.
+
+## Latency (single request, warm)
+
+Before: p50 ~340 ms per decision on a loaded machine; ~86% of it was `row_frame` (a 1-row pandas DataFrame run through
+the batch preprocessing: ~35k pandas `__setitem__` + ~40k `astype` calls per 300 requests, i.e. fixed pandas overhead per
+column, none of it GBDT inference). Profile of 300 requests (cProfile, synthetic world): `featurize` 84 s of 90 s, of which
+`row_frame` 77.6 s (`add_derived_signals` 21.7 s, `build_base_features` 21.3 s, `astype`/`__setitem__` the rest).
+
+What changed (outputs unchanged, tested):
+
+* `src/serving/fast_row.py`: dict/numpy twin of `row_frame` for ONE transaction (id- spelling, raw-dtype coercion incl.
+  float32 rounding, `build_base_features`, uid keys, `_downcast`, `add_derived_signals`). Anything unusual (strings in
+  numeric fields, duplicate `id-`/`id_`, unknown dtypes) raises `FastRowUnsupported` and that request takes the pandas
+  path. `OnlineFeatureEngine.featurize_vals` returns `{feature: float}`; `featurize` still returns a Series.
+  `engine.fast_rows = False` or env `FRAUD_SLOW_ROW_PATH=1` forces the pandas path.
+* `ModelBundle.vector / predict_proba_array / reasons_array`: float32 `(1, n)` array built directly in model column
+  order; LightGBM `predict(..., num_threads=1)` on the numpy array (XGBoost/CatBoost still get a DataFrame built from the
+  array); SHAP reasons on the same array. `bundle.fast_model = False` restores the DataFrame path. A LightGBM model trained
+  with pandas-categorical columns automatically keeps the DataFrame path.
+* `DecisionService`: skips `evaluate_rules_row` (which builds a ~100-column DataFrame) when there are no rules.
+* `scripts/benchmark_latency.py`: p50/p95/p99/mean per stage (features / model / rules_policy / total),
+  `--synthetic` (no trained bundle needed: synthetic IEEE-like world + real LightGBM 300x63 leaves + real blender),
+  `--slow` (legacy pandas row + DataFrame model path), `--profile` (cProfile).
+
+Numbers (`--synthetic --n 300`, shared machine, median of 3 runs, ms):
+
+| | features p50/p95/p99 | model p50 | total p50 | total p95 | total p99 |
+|---|---|---|---|---|---|
+| before (`--slow`) | 145 / 162 / 170 | 4.6 | 150 | 168 | 176 |
+| after | 4.1 / 4.8 / 5.7 | 1.0 | 5.1 | 6.3 | 9.6 |
+
+(Earlier, less loaded `--slow` runs gave ~115 ms; the live-machine figure of ~340 ms included more load and the full
+~400-column schema. The `--slow` baseline already includes the no-rules shortcut; the real legacy run paid another
+~3.7 ms there.) These are synthetic-world numbers: the real raw-schema bundle has not been trained on this machine, so
+rerun `python scripts/benchmark_latency.py --n 2000` once it exists.
+
+Parity evidence: `tests/test_serving_fast_row.py` (7 tests): row dict equality (keys, values, types, missing markers)
+between fast and pandas path on 300 mutated rows x {full, raw} synthetic schemas and on 300 mutated real raw-schema rows
+(`data/processed`, skipped if absent); stateful engines (fast vs `fast_rows=False`) fed 200 mutated transactions
+(missing fields, None/NaN, unseen categories, first-seen clients, odd floats, numpy scalars, `id-` keys, exotic types)
+give feature vectors equal within atol 1e-6 with identical NaN positions; scores and SHAP reasons from the numpy path are
+bit-identical to the DataFrame path; whole-service decisions match.
+
+Remaining bottlenecks (after: ~5 ms total, ~4 ms of it `_stateful`):
+
+* `_stateful` pure-python state step (~3 ms; HMM forward log-likelihood ~55% of it, then `_isnan`/`nan_to_num`). It holds
+  the engine lock, so it caps per-process throughput at ~250 req/s; shard on `uid1` to scale.
+* Calibrator: `IsotonicRegression.predict` input validation (~0.3 ms); could call `f_` directly.
+* Rules: with active rules `evaluate_rules_row` builds a ~100-column DataFrame per request and runs one pandas
+  evaluation per rule (3-4 ms before, not measured here because no rules file exists); precompile rules to dict
+  predicates if it shows up.
+* Possible with new packages (not installed): `onnxruntime`/`treelite` for larger ensembles (GBDT is only ~1 ms here).

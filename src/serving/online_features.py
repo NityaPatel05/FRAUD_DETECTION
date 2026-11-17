@@ -61,6 +61,7 @@ from src.feature_engineering.label_history import LABEL_KEYS
 from src.feature_engineering.derived_signals import vendor_engineered_cols
 from src.feature_engineering.pipeline_v2 import _downcast
 from src.labels.policy import DAY, LabelPolicy, fraud_known_at, maturity_at
+from src.serving.fast_row import FastRowBuilder, FastRowUnsupported
 
 _FE_MODULES = ["src.feature_engineering.base_features", "src.feature_engineering.client_features",
                "src.feature_engineering.derived_signals"]
@@ -218,6 +219,9 @@ class OnlineFeatureEngine:
         self.policy = resolve_policy(meta)
         self.smooth = float(self.cfg["label_smoothing"])
         self.prior = float(meta["train_fraud_rate"])
+        # single-transaction numpy/dict row path (exact twin of row_frame, see fast_row.py); False -> pandas path
+        self.fast_rows = os.environ.get("FRAUD_SLOW_ROW_PATH", "") not in ("1", "true", "True")
+        self._fast = FastRowBuilder(meta)
         self.cat_index = {c: {v: i for i, v in enumerate(cats)} for c, cats in meta["label_maps"].items()}
         self.hmm = {k: tuple(np.asarray(a, dtype=np.float64) for a in v) for k, v in meta.get("hmm_params", {}).items()}
         sv = dict(serving or {})
@@ -779,14 +783,20 @@ class OnlineFeatureEngine:
                 setattr(self, k, v)
 
     # ── public API ───────────────────────────────────────────────────────────
-    def _encode(self, row: pd.Series, stateful: Dict) -> pd.Series:
+    def _encode_vals(self, row, stateful: Dict) -> Dict[str, float]:
+        """Model-ready values {feature: float} (NaN = missing); ``row`` is a dict or Series."""
         vals = {}
+        cat = self.cat_index
+        get = row.get
         for c in self.feature_cols:
-            v = stateful[c] if c in stateful else row.get(c, np.nan)
-            if c in self.cat_index:
-                v = np.nan if _isnan(v) else self.cat_index[c].get(str(v), np.nan)
+            v = stateful[c] if c in stateful else get(c, np.nan)
+            if c in cat:
+                v = np.nan if _isnan(v) else cat[c].get(str(v), np.nan)
             vals[c] = np.nan if _isnan(v) else float(v)
-        return pd.Series(vals, dtype=np.float64)
+        return vals
+
+    def _encode(self, row, stateful: Dict) -> pd.Series:
+        return pd.Series(self._encode_vals(row, stateful), dtype=np.float64)
 
     def check_fields(self, txn: Dict) -> None:
         """Schema=full bundles need Vesta-only fields no real gateway sends: fail loudly, not silently NaN."""
@@ -799,21 +809,36 @@ class OnlineFeatureEngine:
                     f"(V*, C*, D2-D15, id_01-id_11) that the request lacks (e.g. {missing[:5]}). "
                     "Serve the raw-schema bundle (decision_v2.serving_schema: raw).")
 
-    def featurize(self, txn: Dict, labelled: bool = True):
-        """-> (row dict, features Series). Thread-safe; raises DuplicateTransactionError for a known id
-        (no state change). The expensive row-level preprocessing runs outside the lock."""
-        self.check_fields(txn)
+    def _row(self, txn: Dict):
+        """-> (row dict, source for ``_encode``). Fast dict path when it applies, else the pandas path."""
+        if self.fast_rows:
+            try:
+                r = self._fast.build(txn)
+                return r, r
+            except FastRowUnsupported:
+                pass
         rf = self.row_frame(pd.DataFrame([txn]))
-        r = rf.iloc[0].to_dict()
+        return rf.iloc[0].to_dict(), rf.iloc[0]
+
+    def featurize_vals(self, txn: Dict, labelled: bool = True):
+        """-> (row dict, {feature: float}). Thread-safe; raises DuplicateTransactionError for a known id
+        (no state change). The row-level preprocessing runs outside the lock."""
+        self.check_fields(txn)
+        r, src = self._row(txn)
         with self._lock:
             if r["TransactionID"] in self.txn_keys:
                 self.label_stats["duplicate_scores"] += 1
                 raise DuplicateTransactionError(f"TransactionID {r['TransactionID']} was already scored")
             st = self._stateful(r, labelled)
-            x = self._encode(rf.iloc[0], st)
+            vals = self._encode_vals(src, st)
             if self.prune_every and self.n_scored % self.prune_every == 0:
                 self.prune()
-        return r, x
+        return r, vals
+
+    def featurize(self, txn: Dict, labelled: bool = True):
+        """-> (row dict, features Series)."""
+        r, vals = self.featurize_vals(txn, labelled)
+        return r, pd.Series(vals, dtype=np.float64)
 
     def transform(self, txn: Dict) -> pd.Series:
         """Features for ONE new transaction (state is updated: it now counts as history)."""

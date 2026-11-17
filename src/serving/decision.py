@@ -80,6 +80,9 @@ class ModelBundle:
         for name, files in self.spec["model_files"].items():
             self.models[name] = [self._load(name, self.dir / f) for f in files]
         self.version = f"{self.spec['tag']}:{kind}:{int((self.dir / self.spec['blender']).stat().st_mtime)}"
+        self.fast_model = True                       # numpy single-row path (identical scores); False = DataFrame path
+        # a LightGBM model trained with pandas-categorical columns needs the DataFrame mapping
+        self._lgb_numpy = all(getattr(m, "pandas_categorical", None) in (None, []) for m in self.models.get("lgbm", []))
 
     def fingerprint(self) -> str:
         """Identity of the model for snapshot validation: features, files, tag, label policy."""
@@ -111,6 +114,35 @@ class ModelBundle:
             for c in self.cat_cols:
                 X[c] = X[c].fillna(-1).astype(np.int64)
         return model.predict_proba(X)[:, 1]
+
+    # ── single-row numpy API (no DataFrame): x = 1-D vector in ``self.features`` order ──────────────────
+    def vector(self, vals: Dict[str, float]) -> np.ndarray:
+        """float32 row (1, n_features) in this bundle's column order from {feature: float}."""
+        return np.fromiter((vals[f] for f in self.features), dtype=np.float64,
+                           count=len(self.features)).astype(self.dtype).reshape(1, -1)
+
+    def _predict_array(self, name, model, A: np.ndarray) -> np.ndarray:
+        if name == "lgbm" and self._lgb_numpy:
+            return model.predict(A, num_threads=1)               # 1 row: threading only adds overhead
+        return self._predict(name, model, pd.DataFrame(A, columns=self.features))
+
+    def predict_proba_array(self, A: np.ndarray) -> np.ndarray:
+        per_model = {n: np.mean([self._predict_array(n, m, A) for m in ms], axis=0) for n, ms in self.models.items()}
+        return self.blender.predict_proba(per_model)
+
+    def reasons_array(self, A: np.ndarray, top: int = 3) -> List[List[Dict]]:
+        if "lgbm" not in self.models:
+            return [[]]
+        if not self._lgb_numpy:
+            return self.reasons(pd.DataFrame(A, columns=self.features), top)
+        contrib = self.models["lgbm"][0].predict(A, pred_contrib=True, num_threads=1)[:, :-1]
+        out = []
+        for i in range(len(A)):
+            idx = np.argsort(-contrib[i])[:top]
+            out.append([{"feature": self.features[j], "contribution": round(float(contrib[i, j]), 4),
+                         "value": None if np.isnan(A[i, j]) else float(A[i, j]),
+                         "reason": reason_text(self.features[j])} for j in idx if contrib[i, j] > 0])
+        return out
 
     def predict_proba(self, X: pd.DataFrame) -> np.ndarray:
         per_model = {n: np.mean([self._predict(n, m, X) for m in ms], axis=0) for n, ms in self.models.items()}
@@ -249,11 +281,17 @@ class DecisionService:
 
     def _decide(self, txn: Dict) -> Dict:
         t0 = time.perf_counter()
-        row, x = self.engine.featurize(txn)                   # features use history BEFORE this txn (locked)
-        t_feat = time.perf_counter()
-
-        X = x[self.bundle.features].to_frame().T               # each bundle casts to its training dtype
-        p = float(self.bundle.predict_proba(X)[0])
+        arr = hasattr(self.bundle, "predict_proba_array") and getattr(self.bundle, "fast_model", True)
+        if arr:
+            row, vals = self.engine.featurize_vals(txn)        # features use history BEFORE this txn (locked)
+            t_feat = time.perf_counter()
+            X = self.bundle.vector(vals)                       # float32 (1, n) straight in model column order
+            p = float(self.bundle.predict_proba_array(X)[0])
+        else:                                                  # DataFrame path (stub bundles, debugging)
+            row, x = self.engine.featurize(txn)
+            t_feat = time.perf_counter()
+            X = x[self.bundle.features].to_frame().T           # each bundle casts to its training dtype
+            p = float(self.bundle.predict_proba(X)[0])
         uid = row.get("uid1")
         if self.smooth and uid is not None:
             p = self._smoothed(uid, p)
@@ -263,7 +301,8 @@ class DecisionService:
                "amount": float(txn["TransactionAmt"]), "model_version": self.bundle.version,
                "p_fraud": round(p, 6)}
         listed_allow, listed_block = self._listed("allow", row), self._listed("block", row)
-        rules_out = evaluate_rules_row(row, self.rules, now=float(txn.get("TransactionDT", 0)), score=p)
+        rules_out = (evaluate_rules_row(row, self.rules, now=float(txn.get("TransactionDT", 0)), score=p)
+                     if self.rules else {"action": None, "fired": [], "shadow_fired": []})   # no 100-col DataFrame without rules
         if listed_allow:
             action, source = "approve", listed_allow
         elif listed_block:
@@ -281,11 +320,16 @@ class DecisionService:
         rec.update({"action": action, "decided_by": source, "rules_fired": rules_out["fired"],
                     "shadow_rules_fired": rules_out["shadow_fired"]})
         if action != "approve" or p >= self.policy.c.get("explain_min_p", 0.2):
-            rec["reasons"] = self.bundle.reasons(X)[0]
+            rec["reasons"] = (self.bundle.reasons_array(X) if arr else self.bundle.reasons(X))[0]
         if self.challenger is not None:                        # Phase 8: shadow model, logged only
-            Xc = x[self.challenger.features].to_frame().T      # the challenger's OWN feature list
-            rec["challenger"] = {"model_version": self.challenger.version,
-                                 "p_fraud": round(float(self.challenger.predict_proba(Xc)[0]), 6)}
+            if arr and hasattr(self.challenger, "predict_proba_array"):
+                pc = float(self.challenger.predict_proba_array(self.challenger.vector(vals))[0])
+            else:
+                if arr:
+                    x = pd.Series(vals, dtype=np.float64)
+                Xc = x[self.challenger.features].to_frame().T  # the challenger's OWN feature list
+                pc = float(self.challenger.predict_proba(Xc)[0])
+            rec["challenger"] = {"model_version": self.challenger.version, "p_fraud": round(pc, 6)}
         rec["latency_ms"] = {"features": round((t_feat - t0) * 1e3, 2), "model": round((t_model - t_feat) * 1e3, 2),
                              "rules_policy": round((t_rules - t_model) * 1e3, 2),
                              "total": round((time.perf_counter() - t0) * 1e3, 2)}
