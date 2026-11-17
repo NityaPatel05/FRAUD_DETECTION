@@ -900,9 +900,10 @@ class FraudFactory:
         C, M, TT, cards = w.customers, w.merchants, w.terminals, w.cards
         g, gang = self._gang()
         R = float(rng.uniform(14, 40))
-        names = ["digital_goods", "games", "electronics", "gift_cards", "misc_retail"]
+        names = ["digital_goods", "games", "electronics", "gift_cards", "misc_retail", "clothing",
+                 "department_store", "hotels", "airlines", "jewelry"]      # realistic MCC spread, not only risky ones
         mcc = self.mcc_by_name[names[int(rng.integers(0, len(names)))]]
-        if len(self.sleepers) and rng.random() < 0.5:
+        if len(self.sleepers) and rng.random() < 0.7:
             # a long-standing merchant turns bad (bust-out merchant): old open date, sudden volume
             mid = int(rng.choice(self.sleepers))
             if M["kind"][mid] != "normal":
@@ -913,7 +914,9 @@ class FraudFactory:
             country = gang["country"] if rng.random() < 0.15 else 0
             city = int(w.city_of_country(rng, np.array([country]))[0])
             mid = int(M.append(mcc_idx=mcc, mode="cnp", city=city, uses_3ds=False, popularity=1.0,
-                               term_start=len(TT), n_term=1, open_t=t0, kind="collusive")[0])
+                               term_start=len(TT), n_term=1,
+                               open_t=t0 - float(rng.choice([0.0, rng.uniform(30, 700) * DAY], p=[0.3, 0.7])),
+                               kind="collusive")[0])   # many collusive merchants are bought/aged accounts
             TT.append(merchant=mid, virtual=True)
         v0, v1 = rng.uniform(1, 3), rng.uniform(6, 20)
         day_rate = v0 * (v1 / v0) ** (np.arange(int(R)) / max(R - 1, 1))
@@ -924,7 +927,7 @@ class FraudFactory:
         t = (t0 + np.repeat(np.arange(int(R)), n_d) * DAY + rng.uniform(0, DAY, n)).astype(np.int64)
         t.sort()
         comp = [c for c in (self._random_card(t0, 5) for _ in range(int(rng.integers(5, 15)))) if c is not None]
-        complicit = rng.random(n) < (0.4 if comp else 0.0)
+        complicit = rng.random(n) < ((0.3 + 0.4 * rng.random()) if comp else 0.0)
         card = np.empty(n, np.int64)
         stolen_n = int((~complicit).sum())
         stolen_cards = [c for c in (self._any_card(t0) for _ in range(stolen_n)) if c is not None]
@@ -940,22 +943,23 @@ class FraudFactory:
                 card[complicit] = rng.choice(np.array(comp, dtype=np.int64), int(complicit.sum()))
         owner = cards["owner"][card]
         mu, sg = self._mu_sigma(np.full(n, mid))
-        value = np.exp(mu + 0.9 + sg * rng.normal(0, 1, n))
-        value = np.where(rng.random(n) < 0.5, np.round(value) - 0.01, value)
+        value = np.exp(mu + 0.3 + sg * rng.normal(0, 1, n))
+        value = np.where(rng.random(n) < 0.3, np.round(value) - 0.01, value)
         value = np.maximum(value, 1.0)
         dev = np.where(complicit, -1, rng.choice(gang["devices"], n))
         arm = self.tactics.choose(g, "ip")
         ip, ip_arm = self._ips_for_arm(gang, arm, n)
-        cu = np.nonzero(complicit)[0]
-        if len(cu):  # complicit cardholders buy from their own device and IP
+        # a part of the "stolen" traffic is replayed through the victim's own device/IP (credential-and-session theft)
+        cu = np.nonzero(complicit | (rng.random(n) < 0.35))[0]
+        if len(cu):  # complicit cardholders (and some victims) buy from their own device and IP
             dev[cu] = current_device(rng, w, owner[cu].clip(0), t[cu])
             ip[cu] = home_ip(w, owner[cu].clip(0), t[cu])
         iid = self._new_incident("merchant_collusion", gang=g, start=int(t[0]), end=int(t[-1]), merchant=mid)
         kept = self.rows.add(n, t=t, customer=owner, card=card, merchant=mid, terminal=M["term_start"][mid],
                              channel="CNP", pos_entry_mode="ecom", value_usd=value, device=dev, ip=ip,
-                             email_domain=np.where(complicit, C["email"][owner.clip(0)],
+                             email_domain=np.where(complicit | (rng.random(n) < 0.5), C["email"][owner.clip(0)],
                                                    rng.choice(geo.FRAUD_EMAIL[0], n, p=geo.FRAUD_EMAIL[1])).astype(object),
-                             cred_type=np.where(complicit, "owner", "stolen_full").astype(object),
+                             cred_type=np.where(complicit | (rng.random(n) < 0.5), "owner", "stolen_full").astype(object),
                              is_fraud=1, scenario="merchant_collusion", incident=iid, gang=g, tac_ip=ip_arm)
         # refund abuse: money paid back to the complicit cards weeks later
         ref = np.nonzero(complicit & (rng.random(n) < 0.6))[0]
@@ -989,18 +993,19 @@ class FraudFactory:
         price = np.where(rng.random(len(t)) < 0.5, price, np.round(price * rng.lognormal(0, 0.6, len(t)), 2))
         arm = self.tactics.choose(g, "ip")
         ip, ip_arm = self._ips_for_arm(gang, arm, len(t))
-        blend = rng.random(len(t)) < 0.5                  # half of the traffic is routed to look like ordinary shoppers
+        blend = rng.random(len(t)) < 0.8                  # most of the traffic is routed to look like ordinary shoppers
         ip_b, _ = self._ips_for_arm(gang, 1, len(t), clean=True)
         ip = np.where(blend, ip_b, ip)
         dev = np.where(blend, w.new_devices(rng, len(t), -1, "gang", False), rng.choice(gang["devices"], len(t)))
         emails = np.where(blend, [self._legit_email() for _ in range(len(t))], rng.choice(gang["emails"], len(t))).astype(object)
+        t = np.where(rng.random(len(t)) < 0.6, t - (t % DAY) + rng.integers(8, 22, len(t)) * HOUR + rng.integers(0, HOUR, len(t)), t)  # daytime mix
         M["kind"][m] = "front"
         iid = self._new_incident("transaction_laundering", gang=g, start=int(t[0]), end=int(t[-1]), merchant=m)
         return self.rows.add(len(t), t=t, customer=w.cards["owner"][card], card=card, merchant=m,
                              terminal=M["term_start"][m], channel="CNP", pos_entry_mode="ecom", value_usd=price,
                              device=dev, ip=ip,
                              email_domain=emails,
-                             cred_type="stolen_full", is_fraud=1, scenario="transaction_laundering", incident=iid,
+                             cred_type=np.where(rng.random(len(t)) < 0.4, "owner", "stolen_full").astype(object), is_fraud=1, scenario="transaction_laundering", incident=iid,
                              gang=g, tac_ip=ip_arm)
 
     def bust_out(self, t0: float) -> int:

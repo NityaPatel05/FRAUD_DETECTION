@@ -33,9 +33,9 @@ What happens, in order (each step is an existing project script, so nothing is h
  10  policy       cost-based decisions on val: money saved, decline/review rates
  11  exploration  naive vs inverse-propensity evaluation
  12  latency      end-to-end decision latency (p50/p95/p99)
- 13  sequence     optional GRU sequence-score experiment (needs CUDA torch; skipped if absent)
+ 13  sequence     Phase D sequence-embedding keep-rule test (needs CUDA torch on GPU runs; skipped if absent)
  14  final        refit on train+val → Kaggle test predictions (submission CSV)
- 15  sim_generate simulated payments world (real-world fields IEEE lacks) → data/synthetic/v1
+ 15  sim_generate simulated payments world (real-world fields IEEE lacks) → data/synthetic/v2_dense
  16  sim_train    train + evaluate on it: per-scenario recall, novel scenario, ring detection
  17  report       results/FINAL_REPORT.md
 
@@ -497,6 +497,17 @@ def step_gpu_check(args) -> dict:
 # pipeline definition
 # ─────────────────────────────────────────────────────────────────────────────
 
+def sim_world_ok(d: Path) -> bool:
+    """v2_dense world present and generated with the realistic_dense preset (metadata check)."""
+    try:
+        m = json.loads((d / "metadata.json").read_text())
+        c = m["config"]
+        return (c.get("preset") == "realistic_dense" and m.get("generator") == "sim-v2"
+                and (d / "transactions.parquet").exists() and (d / "events.parquet").exists())
+    except Exception:
+        return False
+
+
 def build_steps(args, device: str) -> list:
     dev = ["--device", device]
     quick = args.quick or args.low_memory
@@ -533,16 +544,21 @@ def build_steps(args, device: str) -> list:
         S.append(("latency", False, [[PY, "scripts/benchmark_latency.py", "--n", "500" if quick else "2000",
                                       "--out", "results/latency.json"]]))
     if not args.skip_sequence:
-        S.append(("sequence", False, [[PY, "scripts/run_sequence_experiment.py", "--epochs", "1" if quick else "3", *dev]]))
+        S.append(("sequence", False, [[PY, "scripts/run_sequence_experiment.py", *dev]
+                                      + (["--epochs", "3", "--seeds", "1"] if quick else ["--seeds", "3"])]))
     # --final reuses the validation run's CV (rounds + OOF) when its fingerprint is identical
     S.append(("final", False, [[PY, "scripts/run_training.py", "--final", "--use-tuned", *mdl, *gap, *seeds, *dev]]))
     if not args.skip_sim:
-        sim_gen = [PY, "scripts/run_simulator.py", "--out", "data/synthetic/v1"]
-        if quick:
-            sim_gen += ["--no-validate"]
-        S.append(("sim_generate", False, [sim_gen]))
-        S.append(("sim_train", False, [[PY, "scripts/run_sim_track.py", "--data", "data/synthetic/v1", *dev]
-                                       + (["--quick"] if quick else [])]))
+        sim_dir = ROOT / "data" / "synthetic" / "v2_dense"
+        if sim_world_ok(sim_dir):
+            print(f"[sim] {sim_dir} exists and its metadata matches realistic_dense: skipping generation")
+        else:
+            sim_gen = [PY, "scripts/run_simulator.py", "--preset", "realistic_dense", "--out", "data/synthetic/v2_dense"]
+            if quick:
+                sim_gen += ["--no-validate", "--no-ceiling"]
+            S.append(("sim_generate", False, [sim_gen]))
+        S.append(("sim_train", False, [[PY, "scripts/run_sim_track.py", "--data", "data/synthetic/v2_dense", *dev]
+                                       + (["--quick", "--max-customers", "15000"] if quick else [])]))
     return S
 
 
@@ -767,24 +783,47 @@ def build_report(state: dict) -> None:
     seq = read_json(art("causal") / "seq_experiment.json")
     if seq:
         res["sequence_experiment"] = seq
-        L += ["## Optional GRU sequence score", "",
-              f"CV AUC-PR {seq['base_cv_ap']:.4f} → {seq['with_seq_cv_ap']:.4f} (gain {seq['gain']:+.4f}) → **{seq['verdict']}**", ""]
+        L += ["## Sequence embeddings (Phase D: self-supervised GRU, causal features added to the GBDT)", "",
+              f"{seq.get('n_folds')} rolling folds x {seq.get('seeds')} seeds; deltas paired per fold vs base (mean +/- SE).", "",
+              "| Arm | AUC-PR delta | Cold-start AUC-PR delta | Copied-removed delta | VDR@1% FPR delta | Verdict |",
+              "|---|---|---|---|---|---|"]
+        for arm, d in (seq.get("arms") or {}).items():
+            if arm == "base":
+                continue
+            cell = lambda k: (f"{d[k]['delta']:+.4f} +/- {d[k]['se']:.4f}" if k in d and d[k].get("delta") is not None else "n/a")
+            L.append(f"| {arm} | {cell('ap_all')} | {cell('ap_cold_start')} | {cell('ap_copied_removed')} | "
+                     f"{cell('vdr_1pct')} | **{d.get('verdict')}** |")
+        L.append("")
 
     sim = read_json(ROOT / "artifacts" / "v2" / "sim" / "metrics.json")
     if sim:
         res["simulated_track"] = sim
-        L += ["## Simulated world (Track C) — engineering demonstration, NOT real-world accuracy", "",
-              f"Val AUC-PR **{fmt(sim['val'].get('auc_pr'))}**, test AUC-PR **{fmt(sim['test'].get('auc_pr'))}** "
-              f"(test recall @1% FPR {fmt(sim['test'].get('recall_at_fpr_1pct'))}); features: {sim.get('n_features')}", "",
-              "| Fraud scenario (test) | Transactions | Recall @1% FPR |", "|---|---|---|"]
-        for sc, v in sim.get("test_by_scenario_at_1pct_fpr", {}).items():
-            if not sc.startswith("_"):
-                novel = " (NOVEL — never in training)" if sc in (sim.get("novel_scenarios") or {}) else ""
-                L.append(f"| {sc}{novel} | {v['n']} | {v['recall_at_1pct_fpr']:.1%} |")
-        rings = sim.get("test_by_scenario_at_1pct_fpr", {}).get("_rings")
+        te = sim["test"]
+        tt, tr = te.get("true", {}), te.get("reported", {})
+        L += ["## Simulated world (Track C, v2_dense) - engineering demonstration, NOT real-world accuracy", "",
+              f"Causal features: {sim.get('n_features')} (+{sim.get('n_burst_features')} burst). Targets as known at the "
+              f"cutoff: {sim.get('label_semantics')}.", "",
+              "| Test metric | vs TRUE fraud (is_fraud_true) | vs REPORTED labels (business view) |", "|---|---|---|"]
+        for lab, key in [("AUC-PR", "auc_pr"), ("Recall @1% FPR", "recall_at_fpr_1pct"),
+                         ("Value detection @1% FPR", "vdr_at_fpr_1pct"), ("CP@k (daily)", "cp_at_100_daily"),
+                         ("False-decline rate (top 1%)", "false_decline_rate_top1pct")]:
+            L.append(f"| {lab} | {fmt(tt.get(key))} | {fmt(tr.get(key))} |")
+        L += ["", "| Fraud scenario (test) | Rows | Flagged at 1% FPR |", "|---|---|---|"]
+        for sc, v in te.get("by_scenario", {}).items():
+            novel = " (NOVEL - test only)" if sc in (te.get("novel") or {}) else ""
+            L.append(f"| {sc}{novel} | {v['n']} | {v['flagged_rate']:.1%} |")
+        for k, v in (te.get("slices") or {}).items():
+            L.append(f"| slice: {k} | {v.get('n')} | recall {fmt(v.get('recall_at_op'))} (AP {fmt(v.get('auc_pr'))}) |")
+        ct = sim.get("card_testing_model")
+        if ct:
+            L += ["", "Dedicated card-testing model (burst features) vs general model, card_testing recall:", "",
+                  "| Model | Recall @0.5% FPR | Recall @1% FPR | Overall AUC-PR |", "|---|---|---|---|"]
+            for k in ("general", "specialist", "routed_max"):
+                L.append(f"| {k} | {fmt(ct[k].get('recall_at_fpr_0.5pct'))} | {fmt(ct[k].get('recall_at_fpr_1pct'))} | "
+                         f"{fmt(ct[k].get('auc_pr_overall_true'))} |")
+        rings = te.get("rings")
         if rings:
-            L += ["", f"Mule rings detected (≥1 member flagged): **{rings['rings_detected']:.1%}** of "
-                      f"{rings['n_rings']}; ring transactions flagged: {rings['ring_transactions_flagged']:.1%}"]
+            L += ["", f"Mule rings detected (at least one member flagged): **{rings['rings_detected']:.1%}** of {rings['n_rings']}"]
         L.append("")
 
     fin = art("causal") / "submission_blend.csv"

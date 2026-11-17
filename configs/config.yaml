@@ -326,3 +326,14 @@ feedback_v2:
   explore_q_min:      0.001       # …down to 1 in 1000 for the riskiest
   sim_current_block_rate: 0.01
   sim_candidate_block_rates: [0.005, 0.01, 0.02, 0.03]
+
+# ══════════════════════════════════════════════════════════════════════════════
+#  Phase D - self-supervised sequence embeddings (src/sequence, scripts/run_sequence_experiment.py)
+# ══════════════════════════════════════════════════════════════════════════════
+sequence:
+  hidden:     32          # GRU state per client (32 float32 = 128 B + last_t)
+  emb_dim:    12          # embedding columns added to the GBDT (+4 surprise columns)
+  epochs:     15
+  max_len:    96          # training window; inference streams the full history
+  lr:         0.003
+  cat_cols:   [ProductCD, card4, card6, P_emaildomain, DeviceType, addr1, addr2, DeviceInfo]
